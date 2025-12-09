@@ -85,12 +85,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze simulation benchmark summaries.")
     parser.add_argument(
         "--summary",
+        "--results",
         type=Path,
         default=Path("simulation_benchmark_summary.csv"),
         help="Path to simulation benchmark summary CSV.",
     )
     parser.add_argument(
         "--output-dir",
+        "--outdir",
         type=Path,
         default=Path("figures"),
         help="Directory to store generated plots and tables.",
