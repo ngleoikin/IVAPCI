@@ -48,7 +48,7 @@ python scripts/run_simulation_benchmark.py \
 
 ### 4.2 诊断分析（基于上一步输出）
 ```bash
-python scripts/run_diagnostics_on_simulation.py \
+ python scripts/run_diagnostics_on_simulation.py \
   --scenarios EASY-linear-weak EASY-linear-strong \
   --seeds 0 1 \
   --n 200 \
@@ -72,5 +72,6 @@ python scripts/analyze_simulation_diagnostics.py --results outputs/diag_small/si
 - **安装缓慢或失败**：配置 PyPI 国内镜像或离线源后重试 `pip install -r requirements.txt`。
 - **显存不足/训练慢**：在基准脚本中减小 `--n`、缩短 `--epochs_proxy` 等参数；或仅运行 `smoke_test.py` 进行快速验证。
 - **依赖冲突**：先升级 pip，再在全新虚拟环境中安装；如需特定 PyTorch 版本，可在 `requirements.txt` 中固定镜像源对应的包名。
+- **ModuleNotFoundError: No module named "models"**：请确保从仓库根目录运行脚本（如上示例的 `python scripts/...`）。脚本已自动将项目根目录加入 `sys.path`，无需额外设置 `PYTHONPATH`。
 
 执行以上步骤后，即可完成项目的基础安装与功能验证。
