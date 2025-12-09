@@ -33,6 +33,23 @@ python smoke_test.py
 
 ## 4. 基准与诊断完整流程
 
+### 4.0 场景、变体与推荐测试矩阵
+
+- **模拟场景（`--scenarios`）**：
+  - `EASY-linear-weak`：线性、弱混杂。
+  - `EASY-linear-strong`：线性、强混杂。
+  - `MODERATE-nonlinear`：中等非线性。
+  - `HARD-nonlinear-strong`：强非线性 + 强混杂。
+- **数据量与重复**：通过 `--n`（或 `--n-samples`）控制样本量，通过 `--seeds` 或 `--start-seed + --repetitions` 控制重复次数。
+- **proxy 充足度变体（`--variant`）**：
+  - `full_proxies`（默认）
+  - `weak_proxies` / `missing_Z` / `missing_W` / `partial_X`
+
+> 推荐测试组合
+> 1) **冒烟**：`--scenarios EASY-linear-weak --n 200 --seeds 0`，方法用 `naive ivapci_v2_1`。
+> 2) **小规模回归测试**（示例命令见下文 4.1/4.2）。
+> 3) **完整回归测试**：全部四个场景、`--n 1000`、`--seeds 0 1 2 3 4`，方法全开，运行时间较长但覆盖全面。
+
 ### 4.1 模拟基准（小规模示例）
 ```bash
 python scripts/run_simulation_benchmark.py \
@@ -68,6 +85,32 @@ python scripts/analyze_simulation_results.py --results outputs/bench_small/simul
 python scripts/analyze_simulation_diagnostics.py --results outputs/diag_small/simulation_diagnostics_results.csv --outdir outputs/diag_small/plots
 ```
 输出包含 MAE/RMSE 的柱状图、诊断指标与 ATE 误差的散点相关图，以及可选的 LaTeX 表格。
+
+### 4.4 指标字段释义
+
+**基准输出**（`simulation_benchmark_results.csv`）：
+
+- `scenario` / `seed` / `method`：运行配置。
+- `tau_true`：真实 ATE。
+- `ate_hat`：模型估计的 ATE。
+- `abs_err`、`sq_err`、`rmse`：绝对误差、平方误差、均方根误差。
+- `runtime_sec`：单次运行耗时。
+- `r2_U`（可选）：方法 latent 对真混杂的线性对齐 R²。
+
+**诊断输出**（`simulation_diagnostics_results.csv`）：
+
+- Proxy 信号：`proxy_score`（综合得分）、`proxy_r2_U`、`proxy_r2_Y`、`proxy_auc_A`。
+- 残差风险：`resid_score = |Corr(r_A, r_Y)|`、`resid_corr`、`resid_r2_Y`、`resid_auc_A`。
+- 近端条件数：`prox_cond_score`（条件数）、`prox_cond`、`prox_s_min`、`prox_s_max`。
+- 子空间对齐（有真 U 时）：`subspace_r2_ivapci`、`subspace_r2_pacdt` 以及对应可视化 PNG 路径。
+
+**读图指南**：
+
+- MAE/RMSE 柱状图：越低越好，用于比较各方法精度。
+- 诊断散点：
+  - `proxy_score` 低且误差高 → proxy 信息不足。
+  - `resid_score` 高且 proxy_score 高 → 不可识别风险（残差仍相关）。
+  - `prox_cond_score` 极高 → 近端方程病态，估计不稳定。
 
 ## 5. 常见问题
 
