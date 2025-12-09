@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+
+# Ensure repository root is on the import path when invoked as a script
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from diagnostics.pacd_diagnostics import (
     estimate_residual_risk,

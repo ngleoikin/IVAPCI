@@ -4,7 +4,7 @@ This repository provides the simulation, modeling, and diagnostics tooling descr
 
 ## Setup
 
-Install the Python dependencies before running any benchmarks, diagnostics, or smoke tests:
+Install the Python dependencies before running any benchmarks, diagnostics, or smoke tests (NumPy is pinned to <2 for PyTorch compatibility):
 
 ```bash
 pip install -r requirements.txt

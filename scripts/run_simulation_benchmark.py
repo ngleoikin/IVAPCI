@@ -9,11 +9,18 @@ metrics, and produces both per-run and aggregated CSV summaries.
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
 import pandas as pd
+
+# Ensure repository root is on the import path when invoked as a script
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from models.baselines import DRGLMEstimator, DRRFEstimator, NaiveEstimator, OracleUEstimator
 from models.ivapci_v21 import IVAPCIv21Estimator
