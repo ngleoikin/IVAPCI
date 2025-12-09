@@ -42,6 +42,7 @@ python scripts/run_simulation_benchmark.py \
   --methods naive dr_glm dr_rf oracle_U ivapci_v2_1 pacdt_v3_0 \
   --outdir outputs/bench_small
 ```
+> 如果不传 `--seeds`，脚本将使用 `--start-seed` 和 `--repetitions` 自动生成种子序列；默认输出文件为 `simulation_benchmark_results.csv` 与 `simulation_benchmark_summary.csv`，若指定 `--outdir` 会自动写入该目录。
 生成的关键文件：
 - `simulation_benchmark_results.csv`：每个场景/seed/方法的详细指标。
 - `simulation_benchmark_summary.csv`：聚合后的误差与耗时汇总。
@@ -55,6 +56,7 @@ python scripts/run_simulation_benchmark.py \
   --methods naive dr_glm dr_rf oracle_U ivapci_v2_1 pacdt_v3_0 \
   --outdir outputs/diag_small
 ```
+> 同样地，如未提供 `--seeds`，会使用 `--start-seed` 和 `--repetitions`；诊断结果默认写入 `simulation_diagnostics_results.csv`，若传 `--outdir` 将放在指定目录。
 主要产物：
 - `simulation_diagnostics_results.csv`：残差风险、proxy 强度、近端条件数及子空间对齐等指标。
 - `subspace_plots/`：混杂子空间的 PCA 可视化。

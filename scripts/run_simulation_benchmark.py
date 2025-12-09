@@ -73,6 +73,7 @@ def run_benchmark(
     n_samples: int,
     repetitions: int,
     start_seed: int,
+    seeds: List[int],
     methods: List[str],
     variant: str,
     results_path: str,
@@ -80,8 +81,8 @@ def run_benchmark(
 ) -> None:
     records = []
     for scenario in scenarios:
-        for rep in range(repetitions):
-            seed = start_seed + rep
+        seed_list = seeds or [start_seed + rep for rep in range(repetitions)]
+        for seed in seed_list:
             data = simulate_scenario(scenario, n=n_samples, seed=seed, variant=variant)
             X_all = _concat_features(data)
             A = data["A"]
@@ -143,9 +144,16 @@ def parse_args() -> argparse.Namespace:
         default=list(list_scenarios().keys()),
         help="Simulation scenarios to run.",
     )
-    parser.add_argument("--n-samples", type=int, default=1000, help="Sample size per replicate.")
-    parser.add_argument("--repetitions", type=int, default=3, help="Number of repeats per scenario.")
-    parser.add_argument("--start-seed", type=int, default=0, help="Starting random seed.")
+    parser.add_argument("--n-samples", "--n", type=int, default=1000, help="Sample size per replicate.")
+    parser.add_argument("--repetitions", type=int, default=3, help="Number of repeats per scenario (ignored if --seeds is provided).")
+    parser.add_argument("--start-seed", type=int, default=0, help="Starting random seed (ignored if --seeds is provided).")
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Explicit list of seeds to run. Overrides --start-seed/--repetitions when provided.",
+    )
     parser.add_argument(
         "--methods",
         nargs="+",
@@ -158,22 +166,37 @@ def parse_args() -> argparse.Namespace:
         default="full_proxies",
         help="Proxy/observability variant (full_proxies, weak_proxies, missing_Z, missing_W, partial_X).",
     )
-    parser.add_argument("--results-path", type=str, default="simulation_benchmark_results.csv")
-    parser.add_argument("--summary-path", type=str, default="simulation_benchmark_summary.csv")
+    parser.add_argument("--outdir", type=str, default=None, help="Optional output directory to place results and summary CSVs.")
+    parser.add_argument("--results-path", type=str, default=None, help="Path for the detailed results CSV (overrides --outdir).")
+    parser.add_argument("--summary-path", type=str, default=None, help="Path for the aggregated summary CSV (overrides --outdir).")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    outdir = Path(args.outdir) if args.outdir else None
+    if outdir:
+        outdir.mkdir(parents=True, exist_ok=True)
+    results_path = (
+        Path(args.results_path)
+        if args.results_path is not None
+        else (outdir / "simulation_benchmark_results.csv" if outdir else Path("simulation_benchmark_results.csv"))
+    )
+    summary_path = (
+        Path(args.summary_path)
+        if args.summary_path is not None
+        else (outdir / "simulation_benchmark_summary.csv" if outdir else Path("simulation_benchmark_summary.csv"))
+    )
     run_benchmark(
         scenarios=args.scenarios,
         n_samples=args.n_samples,
         repetitions=args.repetitions,
         start_seed=args.start_seed,
+        seeds=args.seeds or [],
         methods=args.methods,
         variant=args.variant,
-        results_path=args.results_path,
-        summary_path=args.summary_path,
+        results_path=str(results_path),
+        summary_path=str(summary_path),
     )
 
 
