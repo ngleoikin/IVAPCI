@@ -195,13 +195,27 @@ def extract_confounding_subspace(
         axes[0].scatter(true_proj[:, 0], true_proj[:, 1], s=10, alpha=0.7)
         axes[0].set_title("U_true (PCA)")
 
-        if U_hat_ivapci is not None:
-            iv_proj = pca.transform(U_hat_ivapci)
+        def _maybe_project(U_hat: Optional[np.ndarray]):
+            if U_hat is None:
+                return None
+            # Align feature dimensions with the PCA fitted on U_true by trimming or padding
+            target_dim = U_true.shape[1]
+            if U_hat.shape[1] > target_dim:
+                U_adj = U_hat[:, :target_dim]
+            elif U_hat.shape[1] < target_dim:
+                pad = np.zeros((U_hat.shape[0], target_dim - U_hat.shape[1]))
+                U_adj = np.concatenate([U_hat, pad], axis=1)
+            else:
+                U_adj = U_hat
+            return pca.transform(U_adj)
+
+        iv_proj = _maybe_project(U_hat_ivapci)
+        if iv_proj is not None:
             axes[1].scatter(iv_proj[:, 0], iv_proj[:, 1], s=10, alpha=0.7, color="tab:orange")
         axes[1].set_title("IVAPCI latent (PCA basis)")
 
-        if U_hat_pacdt is not None:
-            pac_proj = pca.transform(U_hat_pacdt)
+        pac_proj = _maybe_project(U_hat_pacdt)
+        if pac_proj is not None:
             axes[2].scatter(pac_proj[:, 0], pac_proj[:, 1], s=10, alpha=0.7, color="tab:green")
         axes[2].set_title("PACD-T latent (PCA basis)")
 
