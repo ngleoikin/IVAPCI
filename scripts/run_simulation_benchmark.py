@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from models.baselines import DRGLMEstimator, DRRFEstimator, NaiveEstimator, OracleUEstimator
+from models.ivapci_gold import IVAPCIGoldEstimator
 from models.ivapci_v21 import IVAPCIv21Estimator, IVAPCIv21GLMEstimator
 from models.pacdt_v30 import PACDTv30Estimator
 from simulators.simulators import list_scenarios, simulate_scenario
@@ -41,6 +42,8 @@ def _build_estimator(name: str):
         return IVAPCIv21Estimator()
     if name == "ivapci_v2_1_glm":
         return IVAPCIv21GLMEstimator()
+    if name == "ivapci_gold":
+        return IVAPCIGoldEstimator()
     if name == "pacdt_v3_0":
         return PACDTv30Estimator()
     raise ValueError(f"Unsupported method '{name}'.")
@@ -98,7 +101,7 @@ def run_benchmark(
                 ate_hat = est.estimate_ate(X_input, A, Y)
                 runtime = time.time() - t0
                 r2_u = np.nan
-                if hasattr(est, "get_latent") and method in {"ivapci_v2_1", "ivapci_v2_1_glm", "pacdt_v3_0"}:
+                if hasattr(est, "get_latent") and method in {"ivapci_v2_1", "ivapci_v2_1_glm", "ivapci_gold", "pacdt_v3_0"}:
                     latent = est.get_latent(X_input)
                     r2_u = _latent_r2(data["U"], latent)
                 abs_err = abs(ate_hat - tau_true)
@@ -166,6 +169,7 @@ def parse_args() -> argparse.Namespace:
             "oracle_U",
             "ivapci_v2_1",
             "ivapci_v2_1_glm",
+            "ivapci_gold",
             "pacdt_v3_0",
         ],
         help="Causal estimators to evaluate.",
