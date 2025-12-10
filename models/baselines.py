@@ -19,11 +19,91 @@ from __future__ import annotations
 from typing import Optional
 
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import (
+    GradientBoostingClassifier,
+    GradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
+from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.model_selection import KFold
 
 from . import BaseCausalEstimator
+
+
+def dml_dr_ate_gbdt(
+    U: np.ndarray,
+    A: np.ndarray,
+    Y: np.ndarray,
+    *,
+    n_splits: int = 2,
+    seed: int = 42,
+    n_estimators_prop: int = 300,
+    n_estimators_out: int = 300,
+    max_depth: int = 3,
+    learning_rate: float = 0.05,
+    min_samples_leaf: int = 10,
+) -> float:
+    """Cross-fitted DR ATE estimator using gradient-boosted trees.
+
+    This helper mirrors the GLM and RF DR implementations but swaps in
+    gradient-boosted trees for both the propensity model and the arm-specific
+    outcome regressions. It is designed for use with latent representations
+    such as IVAPCI v2.1 outputs (Gold-NP variant).
+    """
+
+    U = np.asarray(U, dtype=float)
+    A = np.asarray(A, dtype=int).reshape(-1)
+    Y = np.asarray(Y, dtype=float).reshape(-1)
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    psi = np.zeros(U.shape[0], dtype=float)
+
+    def _fit_gbdt_reg(x: np.ndarray, y: np.ndarray) -> GradientBoostingRegressor | DummyRegressor:
+        if len(x) == 0:
+            dummy = DummyRegressor(strategy="constant", constant=float(np.mean(y)) if len(y) else 0.0)
+            dummy.fit(np.zeros((1, U.shape[1])), [0.0])
+            return dummy
+        model = GradientBoostingRegressor(
+            n_estimators=n_estimators_out,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            min_samples_leaf=min_samples_leaf,
+            random_state=seed,
+        )
+        model.fit(x, y)
+        return model
+
+    for train_idx, test_idx in kf.split(U):
+        U_tr, U_te = U[train_idx], U[test_idx]
+        A_tr, A_te = A[train_idx], A[test_idx]
+        Y_tr, Y_te = Y[train_idx], Y[test_idx]
+
+        prop_clf = GradientBoostingClassifier(
+            n_estimators=n_estimators_prop,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            min_samples_leaf=min_samples_leaf,
+            random_state=seed,
+        )
+        prop_clf.fit(U_tr, A_tr)
+        e_hat = np.clip(prop_clf.predict_proba(U_te)[:, 1], 1e-3, 1 - 1e-3)
+
+        m1_model = _fit_gbdt_reg(U_tr[A_tr == 1], Y_tr[A_tr == 1])
+        m0_model = _fit_gbdt_reg(U_tr[A_tr == 0], Y_tr[A_tr == 0])
+
+        m1_hat = m1_model.predict(U_te)
+        m0_hat = m0_model.predict(U_te)
+        m_hat = np.where(A_te == 1, m1_hat, m0_hat)
+
+        psi[test_idx] = (
+            (A_te - e_hat) / (e_hat * (1.0 - e_hat)) * (Y_te - m_hat)
+            + m1_hat
+            - m0_hat
+        )
+
+    return float(psi.mean())
 
 
 class NaiveEstimator(BaseCausalEstimator):
@@ -196,6 +276,7 @@ class OracleUEstimator(BaseCausalEstimator):
 
 
 __all__ = [
+    "dml_dr_ate_gbdt",
     "NaiveEstimator",
     "DRGLMEstimator",
     "DRRFEstimator",
