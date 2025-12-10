@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.model_selection import KFold
+from sklearn.tree import DecisionTreeRegressor
 
 from . import BaseCausalEstimator
 
@@ -338,4 +339,45 @@ class PACDTv30Estimator(BaseCausalEstimator):
         return float(np.mean(psi))
 
 
-__all__ = ["PACDTConfig", "PACDTv30Estimator"]
+class PACDTree:
+    """Lightweight tree partitioner used for PACD-style leaf splits.
+
+    The tree is trained on latent features ``U`` (optionally concatenated with
+    treatment as a feature) to predict outcomes and is later used purely for
+    partitioning via ``apply``. This keeps compatibility with the PACD-T
+    estimator while exposing a simple interface for hybrid estimators.
+    """
+
+    def __init__(
+        self,
+        max_depth: int = 3,
+        min_leaf_size: int = 120,
+        seed: int = 42,
+        include_treatment: bool = True,
+    ) -> None:
+        self.include_treatment = include_treatment
+        self._tree = DecisionTreeRegressor(
+            max_depth=max_depth,
+            min_samples_leaf=min_leaf_size,
+            random_state=seed,
+        )
+
+    def fit(self, U: np.ndarray, A: np.ndarray, Y: np.ndarray) -> None:
+        U = np.asarray(U)
+        A = np.asarray(A).reshape(-1, 1)
+        Y = np.asarray(Y).reshape(-1)
+        features = np.hstack([U, A]) if self.include_treatment else U
+        self._tree.fit(features, Y)
+
+    def apply(self, U: np.ndarray, A: Optional[np.ndarray] = None) -> np.ndarray:
+        U = np.asarray(U)
+        if self.include_treatment:
+            if A is None:
+                raise ValueError("Treatment vector A is required when include_treatment=True")
+            features = np.hstack([U, np.asarray(A).reshape(-1, 1)])
+        else:
+            features = U
+        return self._tree.apply(features)
+
+
+__all__ = ["PACDTConfig", "PACDTv30Estimator", "PACDTree"]

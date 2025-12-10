@@ -8,17 +8,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.dummy import DummyRegressor
-from sklearn.ensemble import (
-    GradientBoostingClassifier,
-    GradientBoostingRegressor,
-    RandomForestClassifier,
-    RandomForestRegressor,
-)
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.model_selection import KFold, train_test_split
 
 from . import BaseCausalEstimator
-from .baselines import dml_dr_ate_gbdt
 
 
 def _standardize(train: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -374,35 +367,5 @@ class IVAPCIv21GLMEstimator(IVAPCIv21Estimator):
         return float(np.mean(psi))
 
 
-class IVAPCIGoldNP(IVAPCIv21Estimator):
-    """IVAPCI v2.1 representation with nonparametric GBDT DR head (Gold-NP)."""
-
-    def _dr_ate(
-        self,
-        U: np.ndarray,
-        A: np.ndarray,
-        Y: np.ndarray,
-        *,
-        n_splits: int = 2,
-        n_estimators_prop: int = 300,
-        n_estimators_out: int = 300,
-        max_depth: int = 3,
-        learning_rate: float = 0.05,
-        min_samples_leaf: int = 10,
-    ) -> float:
-        # Leverage shared helper to mirror the GLM/ RF DR structure with GBDT base learners.
-        return dml_dr_ate_gbdt(
-            U,
-            A,
-            Y,
-            n_splits=n_splits,
-            seed=self.config.seed,
-            n_estimators_prop=n_estimators_prop,
-            n_estimators_out=n_estimators_out,
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            min_samples_leaf=min_samples_leaf,
-        )
-
-
-__all__ = ["IVAPCIConfig", "IVAPCIv21Estimator", "IVAPCIv21GLMEstimator", "IVAPCIGoldNP"]
+__all__ = ["IVAPCIConfig", "IVAPCIv21Estimator", "IVAPCIv21GLMEstimator"]
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor

@@ -1,6 +1,6 @@
 # IVAPCI
 
-This repository provides the simulation, modeling, and diagnostics tooling described in `docs/pacd_benchmark_design.md`, including IVAPCI v2.1 (RF-DR + GLM-DR variants), the proxy-only IVAPCI-Gold representation, the Gold-NP GBDT-DR variant, PACD-T v3.0, and supporting baselines.
+This repository provides the simulation, modeling, and diagnostics tooling described in `docs/pacd_benchmark_design.md`, including IVAPCI v2.1 (RF-DR + GLM-DR variants), the proxy-only IVAPCI-Gold representation, the PACD-partitioned IVAPCI-PACD-GLM variant, PACD-T v3.0, and supporting baselines.
 
 ## Setup
 

@@ -24,7 +24,8 @@ from diagnostics.pacd_diagnostics import (
 )
 from models.baselines import DRGLMEstimator, DRRFEstimator, NaiveEstimator, OracleUEstimator
 from models.ivapci_gold import IVAPCIGoldEstimator
-from models.ivapci_v21 import IVAPCIGoldNP, IVAPCIv21Estimator, IVAPCIv21GLMEstimator
+from models.ivapci_v21 import IVAPCIv21Estimator, IVAPCIv21GLMEstimator
+from models.ivapci_v2_1_pacd_glm import IVAPCIPACDTGLMEstimator
 from models.pacdt_v30 import PACDTv30Estimator
 from simulators.simulators import list_scenarios, simulate_scenario
 
@@ -42,8 +43,8 @@ def _build_estimator(name: str):
         return IVAPCIv21Estimator()
     if name == "ivapci_v2_1_glm":
         return IVAPCIv21GLMEstimator()
-    if name == "ivapci_v2_1_np":
-        return IVAPCIGoldNP()
+    if name == "ivapci_v2_1_pacd_glm":
+        return IVAPCIPACDTGLMEstimator()
     if name == "ivapci_gold":
         return IVAPCIGoldEstimator()
     if name == "pacdt_v3_0":
@@ -138,7 +139,7 @@ def run_diagnostics(
                     "subspace_r2_pacdt": np.nan,
                 }
 
-                if method in {"ivapci_v2_1", "ivapci_v2_1_glm", "ivapci_v2_1_np", "ivapci_gold"}:
+                if method in {"ivapci_v2_1", "ivapci_v2_1_glm", "ivapci_v2_1_pacd_glm", "ivapci_gold"}:
                     row["subspace_r2_ivapci"] = _latent_r2(data["U"], latent)
                 elif method == "pacdt_v3_0":
                     row["subspace_r2_pacdt"] = _latent_r2(data["U"], latent)
@@ -151,7 +152,7 @@ def run_diagnostics(
                 if iv_latent is None:
                     iv_latent = latent_store.get("ivapci_v2_1_glm")
                 if iv_latent is None:
-                    iv_latent = latent_store.get("ivapci_v2_1_np")
+                    iv_latent = latent_store.get("ivapci_v2_1_pacd_glm")
                 if iv_latent is None:
                     iv_latent = latent_store.get("ivapci_gold")
 
@@ -199,7 +200,7 @@ def parse_args() -> argparse.Namespace:
             "oracle_U",
             "ivapci_v2_1",
             "ivapci_v2_1_glm",
-            "ivapci_v2_1_np",
+            "ivapci_v2_1_pacd_glm",
             "ivapci_gold",
             "pacdt_v3_0",
         ],
