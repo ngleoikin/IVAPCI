@@ -26,6 +26,7 @@ from models.baselines import DRGLMEstimator, DRRFEstimator, NaiveEstimator, Orac
 from models.ivapci_gold import IVAPCIGoldEstimator
 from models.ivapci_v21 import IVAPCIv21Estimator, IVAPCIv21GLMEstimator
 from models.ivapci_v2_1_pacd_glm import IVAPCIPACDTGLMEstimator
+from models.ivapci_v31_pacd_encoder import IVAPCIv31PACDEncoderEstimator
 from models.pacdt_v30 import PACDTv30Estimator
 from simulators.simulators import list_scenarios, simulate_scenario
 
@@ -45,6 +46,8 @@ def _build_estimator(name: str):
         return IVAPCIv21GLMEstimator()
     if name == "ivapci_v2_1_pacd_glm":
         return IVAPCIPACDTGLMEstimator()
+    if name == "ivapci_v3_1_pacd":
+        return IVAPCIv31PACDEncoderEstimator()
     if name == "ivapci_gold":
         return IVAPCIGoldEstimator()
     if name == "pacdt_v3_0":
@@ -108,6 +111,7 @@ def run_benchmark(
                     "ivapci_v2_1",
                     "ivapci_v2_1_glm",
                     "ivapci_v2_1_pacd_glm",
+                    "ivapci_v3_1_pacd",
                     "ivapci_gold",
                     "pacdt_v3_0",
                 }:
@@ -179,6 +183,7 @@ def parse_args() -> argparse.Namespace:
             "ivapci_v2_1",
             "ivapci_v2_1_glm",
             "ivapci_v2_1_pacd_glm",
+            "ivapci_v3_1_pacd",
             "ivapci_gold",
             "pacdt_v3_0",
         ],
