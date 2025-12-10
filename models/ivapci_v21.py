@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.model_selection import KFold, train_test_split
 
 from . import BaseCausalEstimator
@@ -314,4 +315,57 @@ class IVAPCIv21Estimator(BaseCausalEstimator):
         return float(np.mean(psi))
 
 
-__all__ = ["IVAPCIConfig", "IVAPCIv21Estimator"]
+class IVAPCIv21GLMEstimator(IVAPCIv21Estimator):
+    """IVAPCI v2.1 with the original DR-GLM head for comparison.
+
+    Representation learning matches :class:`IVAPCIv21Estimator`; only the
+    doubly robust stage differs, swapping the RF propensity/outcome learners for
+    logistic and linear regression baselines (2-fold cross-fitting).
+    """
+
+    def _dr_ate(self, U: np.ndarray, A: np.ndarray, Y: np.ndarray) -> float:
+        U = np.asarray(U)
+        A = np.asarray(A).reshape(-1)
+        Y = np.asarray(Y).reshape(-1)
+
+        kf = KFold(n_splits=2, shuffle=True, random_state=self.config.seed)
+        psi = np.zeros_like(Y, dtype=float)
+
+        for train_idx, test_idx in kf.split(U):
+            U_train, U_test = U[train_idx], U[test_idx]
+            A_train, A_test = A[train_idx], A[test_idx]
+            Y_train, Y_test = Y[train_idx], Y[test_idx]
+
+            prop_model = LogisticRegression(
+                penalty="l2",
+                C=1.0,
+                solver="lbfgs",
+                max_iter=1000,
+            )
+            prop_model.fit(U_train, A_train)
+            e_hat = np.clip(prop_model.predict_proba(U_test)[:, 1], 1e-3, 1 - 1e-3)
+
+            def _fit_or_dummy(mask: np.ndarray) -> LinearRegression | DummyRegressor:
+                if np.sum(mask) == 0:
+                    return DummyRegressor(strategy="constant", constant=float(np.mean(Y_train)) if len(Y_train) else 0.0).fit(
+                        np.zeros((1, U_train.shape[1])), [0.0]
+                    )
+                return LinearRegression().fit(U_train[mask], Y_train[mask])
+
+            m1_model = _fit_or_dummy(A_train == 1)
+            m0_model = _fit_or_dummy(A_train == 0)
+
+            m1_hat = m1_model.predict(U_test)
+            m0_hat = m0_model.predict(U_test)
+            m_hat = np.where(A_test == 1, m1_hat, m0_hat)
+
+            psi[test_idx] = (
+                (A_test - e_hat) / (e_hat * (1 - e_hat)) * (Y_test - m_hat)
+                + m1_hat
+                - m0_hat
+            )
+
+        return float(np.mean(psi))
+
+
+__all__ = ["IVAPCIConfig", "IVAPCIv21Estimator", "IVAPCIv21GLMEstimator"]

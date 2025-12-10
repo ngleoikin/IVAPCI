@@ -46,7 +46,7 @@ python smoke_test.py
   - `weak_proxies` / `missing_Z` / `missing_W` / `partial_X`
 
 > 推荐测试组合
-> 1) **冒烟**：`--scenarios EASY-linear-weak --n 200 --seeds 0`，方法用 `naive ivapci_v2_1`。
+> 1) **冒烟**：`--scenarios EASY-linear-weak --n 200 --seeds 0`，方法用 `naive ivapci_v2_1 ivapci_v2_1_glm` 对比 RF/GLM DR。
 > 2) **小规模回归测试**（示例命令见下文 4.1/4.2）。
 > 3) **完整回归测试**：全部四个场景、`--n 1000`、`--seeds 0 1 2 3 4`，方法全开，运行时间较长但覆盖全面。
 
@@ -56,7 +56,7 @@ python scripts/run_simulation_benchmark.py \
   --scenarios EASY-linear-weak EASY-linear-strong \
   --seeds 0 1 \
   --n 200 \
-  --methods naive dr_glm dr_rf oracle_U ivapci_v2_1 pacdt_v3_0 \
+  --methods naive dr_glm dr_rf oracle_U ivapci_v2_1 ivapci_v2_1_glm pacdt_v3_0 \
   --outdir outputs/bench_small
 ```
 > 如果不传 `--seeds`，脚本将使用 `--start-seed` 和 `--repetitions` 自动生成种子序列；默认输出文件为 `simulation_benchmark_results.csv` 与 `simulation_benchmark_summary.csv`，若指定 `--outdir` 会自动写入该目录。
@@ -70,7 +70,7 @@ python scripts/run_simulation_benchmark.py \
   --scenarios EASY-linear-weak EASY-linear-strong \
   --seeds 0 1 \
   --n 200 \
-  --methods naive dr_glm dr_rf oracle_U ivapci_v2_1 pacdt_v3_0 \
+  --methods naive dr_glm dr_rf oracle_U ivapci_v2_1 ivapci_v2_1_glm pacdt_v3_0 \
   --outdir outputs/diag_small
 ```
 > 同样地，如未提供 `--seeds`，会使用 `--start-seed` 和 `--repetitions`；诊断结果默认写入 `simulation_diagnostics_results.csv`，若传 `--outdir` 将放在指定目录。
