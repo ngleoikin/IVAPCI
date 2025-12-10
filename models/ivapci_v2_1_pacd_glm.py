@@ -32,7 +32,12 @@ def _dr_scores_glm_local(
     n_splits: int = 2,
     seed: int = 42,
 ) -> np.ndarray:
-    """Compute DR-GLM scores within a single leaf using cross-fitting."""
+    """Compute DR-GLM scores within a single leaf using cross-fitting.
+
+    If a leaf lacks both treatment arms or is too small to cross-fit, the scores
+    gracefully fall back to a single-model DR calculation rather than raising
+    errors, ensuring callers can choose to keep global estimates instead.
+    """
 
     U = np.asarray(U)
     A = np.asarray(A).reshape(-1)
@@ -40,6 +45,11 @@ def _dr_scores_glm_local(
 
     n = U.shape[0]
     psi = np.zeros(n, dtype=float)
+
+    # If there is only one treatment arm or too few samples, return zeros so
+    # callers can fall back to global estimates without crashing.
+    if np.unique(A).size < 2 or n < 2:
+        return psi
 
     if n_splits <= 1 or n < 2 * n_splits:
         clf = LogisticRegression(solver="lbfgs", max_iter=1000)
@@ -53,9 +63,12 @@ def _dr_scores_glm_local(
         m1_hat = reg.predict(X1)
         m0_hat = reg.predict(X0)
 
-        psi[:] = m1_hat - m0_hat + A * (Y - m1_hat) / e_hat - (1 - A) * (
-            Y - m0_hat
-        ) / (1 - e_hat)
+        psi[:] = (
+            m1_hat
+            - m0_hat
+            + A * (Y - m1_hat) / e_hat
+            - (1 - A) * (Y - m0_hat) / (1 - e_hat)
+        )
         return psi
 
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
@@ -64,6 +77,10 @@ def _dr_scores_glm_local(
         A_tr, A_te = A[train_idx], A[test_idx]
         Y_tr, Y_te = Y[train_idx], Y[test_idx]
 
+        # Extreme imbalance inside a fold: skip and rely on other folds/global
+        if np.unique(A_tr).size < 2:
+            continue
+
         clf = LogisticRegression(solver="lbfgs", max_iter=1000)
         clf.fit(U_tr, A_tr)
         e_hat = clf.predict_proba(U_te)[:, 1].clip(1e-3, 1 - 1e-3)
@@ -71,16 +88,17 @@ def _dr_scores_glm_local(
         X_tr = np.column_stack([A_tr, U_tr])
         reg = LinearRegression().fit(X_tr, Y_tr)
 
-        X_te = np.column_stack([A_te, U_te])
-        m_hat = reg.predict(X_te)
         X1 = np.column_stack([np.ones_like(A_te), U_te])
         X0 = np.column_stack([np.zeros_like(A_te), U_te])
         m1_hat = reg.predict(X1)
         m0_hat = reg.predict(X0)
 
-        psi[test_idx] = m1_hat - m0_hat + A_te * (Y_te - m1_hat) / e_hat - (
-            1 - A_te
-        ) * (Y_te - m0_hat) / (1 - e_hat)
+        psi[test_idx] = (
+            m1_hat
+            - m0_hat
+            + A_te * (Y_te - m1_hat) / e_hat
+            - (1 - A_te) * (Y_te - m0_hat) / (1 - e_hat)
+        )
 
     return psi
 
@@ -129,18 +147,33 @@ class IVAPCIPACDTGLMEstimator(BaseCausalEstimator):
         U_hat = self._ivapci_encoder.get_latent(X_all)
         leaf_ids = self._tree.apply(U_hat, A)
 
-        psi = np.zeros_like(Y, dtype=float)
+        # Global DR-GLM as a stable fallback for small or imbalanced leaves
+        psi_global = _dr_scores_glm_local(
+            U_hat,
+            A,
+            Y,
+            n_splits=self.config.n_splits,
+            seed=self.config.seed,
+        )
+        psi = psi_global.copy()
+
         for leaf in np.unique(leaf_ids):
             idx = np.where(leaf_ids == leaf)[0]
-            if len(idx) < self.config.min_leaf_for_dr:
+            if idx.size < self.config.min_leaf_for_dr:
+                # keep global estimates for small leaves
                 continue
-            psi[idx] = _dr_scores_glm_local(
+
+            psi_leaf = _dr_scores_glm_local(
                 U_hat[idx],
                 A[idx],
                 Y[idx],
                 n_splits=self.config.n_splits,
                 seed=self.config.seed + int(leaf),
             )
+
+            # Only override when we obtained meaningful local scores
+            if np.any(psi_leaf):
+                psi[idx] = psi_leaf
 
         return float(psi.mean())
 
