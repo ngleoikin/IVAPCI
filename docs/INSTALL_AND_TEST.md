@@ -16,13 +16,18 @@ python -m pip install --upgrade pip
 
 ## 2. 安装依赖
 
-所有依赖已列在 `requirements.txt` 中，已固定一组互相兼容的版本（`numpy==1.26.4`、`scipy==1.11.4`、`scikit-learn==1.3.2` 等），直接安装即可：
+所有依赖已列在 `requirements.txt` 中，已固定一组互相兼容的版本（`numpy==1.26.4`、`scipy==1.11.4`、`scikit-learn==1.3.2`、`onnx==1.15.0`、`torch==2.2.2` 等），直接安装即可：
 ```bash
 pip install -r requirements.txt
 ```
 > 若机器上已有 `numpy>=2`、`scipy`、`scikit-learn` 等由其他版本编译的包，建议先“重置”三件套，以避免二进制兼容性错误：
 > ```bash
 > pip install --force-reinstall --no-cache-dir "numpy==1.26.4" "scipy==1.11.4" "scikit-learn==1.3.2"
+> pip install -r requirements.txt
+> ```
+> 若出现 `ImportError: cannot import name "DiagnosticOptions" from torch.onnx._internal.exporter`，通常是本地存在另一份不兼容的 PyTorch/ONNX 安装，可通过重新安装固定版本解决：
+> ```bash
+> pip install --force-reinstall --no-cache-dir "torch==2.2.2" "onnx==1.15.0"
 > pip install -r requirements.txt
 > ```
 > 若处于内网/代理环境，请先配置镜像源；本项目不需要额外的系统级库。
