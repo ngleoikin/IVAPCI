@@ -140,14 +140,22 @@ def run_diagnostics(
 
                 records.append(row)
 
-            if {"ivapci_v2_1", "pacdt_v3_0"}.issubset(latent_store.keys()):
-                extract_confounding_subspace(
-                    data["U"],
-                    latent_store.get("ivapci_v2_1") or latent_store.get("ivapci_v2_1_glm"),
-                    latent_store.get("pacdt_v3_0"),
-                    scenario=scenario,
-                    rep=seed,
-                )
+            if "pacdt_v3_0" in latent_store:
+                # Prefer the primary IVAPCI latent, fall back to the GLM variant if available.
+                iv_latent = latent_store.get("ivapci_v2_1")
+                if iv_latent is None:
+                    iv_latent = latent_store.get("ivapci_v2_1_glm")
+
+                pacdt_latent = latent_store.get("pacdt_v3_0")
+
+                if iv_latent is not None and pacdt_latent is not None:
+                    extract_confounding_subspace(
+                        data["U"],
+                        iv_latent,
+                        pacdt_latent,
+                        scenario=scenario,
+                        rep=seed,
+                    )
 
     df = pd.DataFrame.from_records(records)
     df.to_csv(results_path, index=False)
