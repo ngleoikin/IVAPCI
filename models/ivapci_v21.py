@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.dummy import DummyRegressor
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.model_selection import KFold, train_test_split
 
@@ -367,5 +368,112 @@ class IVAPCIv21GLMEstimator(IVAPCIv21Estimator):
         return float(np.mean(psi))
 
 
-__all__ = ["IVAPCIConfig", "IVAPCIv21Estimator", "IVAPCIv21GLMEstimator"]
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+class IVAPCIv21RADREstimator(IVAPCIv21Estimator):
+    """IVAPCI v2.1 with head-calibrated RADR doubly robust estimator.
+
+    Stage 1 reuses the standard IVAPCI v2.1 representation (proxy VAE + AY
+    heads). Stage 2 runs a RADR calibration that leverages the trained heads:
+
+    * Propensity calibration: logistic regression on [s(U), U], where s(U) is
+      the A-head logit.
+    * Outcome calibration: linear regression on [A, U, t(A,U), A * t(A,U)]
+      where t(A,U) is the Y-head prediction (destandardized).
+
+    Both nuisance models are cross-fitted (2-fold by default) and plugged into
+    the standard DR/AIPW score to estimate the ATE. When a fold has a single
+    treatment arm, constant fallbacks are used to avoid training errors.
+    """
+
+    def _head_features(
+        self, U: np.ndarray, A: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Compute head-based features (s(U), t(A,U), t(1,U), t(0,U))."""
+
+        U_t = torch.from_numpy(U.astype(np.float32)).to(self.device)
+        A_t = torch.from_numpy(A.astype(np.float32)).to(self.device)
+        self.a_head.eval()
+        self.y_head.eval()
+        with torch.no_grad():
+            s_logits = self.a_head(U_t).cpu().numpy()
+            t_obs_std = self.y_head(U_t, A_t).cpu().numpy()
+            ones = torch.ones_like(A_t)
+            zeros = torch.zeros_like(A_t)
+            t1_std = self.y_head(U_t, ones).cpu().numpy()
+            t0_std = self.y_head(U_t, zeros).cpu().numpy()
+
+        y_std = float(self._y_std.squeeze()) if hasattr(self, "_y_std") else 1.0
+        y_mean = float(self._y_mean.squeeze()) if hasattr(self, "_y_mean") else 0.0
+
+        def _destandardize(arr: np.ndarray) -> np.ndarray:
+            return arr * y_std + y_mean
+
+        return (
+            s_logits,
+            _destandardize(t_obs_std),
+            _destandardize(t1_std),
+            _destandardize(t0_std),
+        )
+
+    def _dr_ate(self, U: np.ndarray, A: np.ndarray, Y: np.ndarray) -> float:
+        U = np.asarray(U)
+        A = np.asarray(A).reshape(-1)
+        Y = np.asarray(Y).reshape(-1)
+
+        s_logits, t_obs, t1_all, t0_all = self._head_features(U, A)
+
+        kf = KFold(n_splits=2, shuffle=True, random_state=self.config.seed)
+        psi = np.zeros_like(Y, dtype=float)
+
+        for train_idx, test_idx in kf.split(U):
+            U_train, U_test = U[train_idx], U[test_idx]
+            A_train, A_test = A[train_idx], A[test_idx]
+            Y_train, Y_test = Y[train_idx], Y[test_idx]
+            s_train, s_test = s_logits[train_idx], s_logits[test_idx]
+            t_train, t_test = t_obs[train_idx], t_obs[test_idx]
+            t1_test, t0_test = t1_all[test_idx], t0_all[test_idx]
+
+            # Propensity calibration: logistic on [s(U), U]
+            if np.unique(A_train).size < 2:
+                p_const = float(np.mean(A_train)) if len(A_train) else 0.5
+                e_hat = np.full_like(A_test, fill_value=p_const, dtype=float)
+            else:
+                prop_model = LogisticRegression(max_iter=2000, solver="lbfgs")
+                X_prop_train = np.column_stack([s_train, U_train])
+                X_prop_test = np.column_stack([s_test, U_test])
+                prop_model.fit(X_prop_train, A_train)
+                e_hat = prop_model.predict_proba(X_prop_test)[:, 1]
+            e_hat = np.clip(e_hat, 1e-3, 1 - 1e-3)
+
+            # Outcome calibration: linear on [A, U, t(A,U), A*t(A,U)]
+            X_out_train = np.column_stack([A_train, U_train, t_train, A_train * t_train])
+            if len(A_train) == 0:
+                out_model: LinearRegression | DummyRegressor = DummyRegressor(
+                    strategy="constant", constant=float(np.mean(Y_train)) if len(Y_train) else 0.0
+                ).fit(np.zeros((1, X_out_train.shape[1])), [0.0])
+            else:
+                out_model = LinearRegression()
+                out_model.fit(X_out_train, Y_train)
+
+            X_out_test = np.column_stack([A_test, U_test, t_test, A_test * t_test])
+            m_hat = out_model.predict(X_out_test)
+
+            X1 = np.column_stack([np.ones_like(A_test), U_test, t1_test, t1_test])
+            X0 = np.column_stack([np.zeros_like(A_test), U_test, t0_test, np.zeros_like(t0_test)])
+            m1_hat = out_model.predict(X1)
+            m0_hat = out_model.predict(X0)
+
+            psi[test_idx] = (
+                m1_hat
+                - m0_hat
+                + (A_test - e_hat) / (e_hat * (1 - e_hat)) * (Y_test - m_hat)
+            )
+
+        return float(np.mean(psi))
+
+
+__all__ = [
+    "IVAPCIConfig",
+    "IVAPCIv21Estimator",
+    "IVAPCIv21GLMEstimator",
+    "IVAPCIv21RADREstimator",
+]
