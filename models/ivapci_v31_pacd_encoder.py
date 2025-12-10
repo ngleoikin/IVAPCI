@@ -239,6 +239,19 @@ class IVAPCIv31PACDEncoderEstimator(BaseCausalEstimator):
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True)
         val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=cfg.batch_size, shuffle=False)
 
+        def forward_proxy_only(xb: torch.Tensor):
+            """Proxy-only forward pass for pretraining to avoid unnecessary heads."""
+            h = self.shared(xb)
+            mu_c, logvar_c = self.c_head(h)
+            mu_n, logvar_n = self.n_head(h)
+            z_c = _reparameterize(mu_c, logvar_c)
+            z_n = _reparameterize(mu_n, logvar_n)
+            x_recon = self.proxy_decoder(torch.cat([z_c, z_n], dim=1))
+            recon_loss = mse_loss(x_recon, xb)
+            kl_c = _kl_loss(mu_c, logvar_c)
+            kl_n = _kl_loss(mu_n, logvar_n)
+            return recon_loss, kl_c, kl_n
+
         def forward_batch(xb: torch.Tensor, ab: torch.Tensor, yb: torch.Tensor):
             h = self.shared(xb)
             mu_c, logvar_c = self.c_head(h)
@@ -267,7 +280,7 @@ class IVAPCIv31PACDEncoderEstimator(BaseCausalEstimator):
             count = 0
             for xb, _, _ in train_loader:
                 xb = xb.to(self.device)
-                recon, kl_c, kl_n, _, _, _, _ = forward_batch(xb, torch.zeros_like(xb[:, 0]), torch.zeros_like(xb[:, 0]))
+                recon, kl_c, kl_n = forward_proxy_only(xb)
                 loss = recon + cfg.beta_c * kl_c + cfg.beta_n * kl_n
                 self.main_opt.zero_grad()
                 loss.backward()
