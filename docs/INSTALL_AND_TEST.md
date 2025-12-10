@@ -16,11 +16,15 @@ python -m pip install --upgrade pip
 
 ## 2. 安装依赖
 
-所有依赖已列在 `requirements.txt` 中，直接安装（已固定 `numpy<2` 以兼容当前 PyTorch 版本）：
+所有依赖已列在 `requirements.txt` 中，已固定一组互相兼容的版本（`numpy==1.26.4`、`scipy==1.11.4`、`scikit-learn==1.3.2` 等），直接安装即可：
 ```bash
 pip install -r requirements.txt
 ```
-> 若之前安装过 `numpy>=2` 导致 PyTorch 加载失败，请先运行 `pip install "numpy<2" --force-reinstall` 再执行上述命令。
+> 若机器上已有 `numpy>=2`、`scipy`、`scikit-learn` 等由其他版本编译的包，建议先“重置”三件套，以避免二进制兼容性错误：
+> ```bash
+> pip install --force-reinstall --no-cache-dir "numpy==1.26.4" "scipy==1.11.4" "scikit-learn==1.3.2"
+> pip install -r requirements.txt
+> ```
 > 若处于内网/代理环境，请先配置镜像源；本项目不需要额外的系统级库。
 
 ## 3. 快速自检（smoke test）
