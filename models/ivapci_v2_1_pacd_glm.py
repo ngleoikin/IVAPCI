@@ -51,6 +51,7 @@ def _dr_scores_glm_local(
     if np.unique(A).size < 2 or n < 2:
         return psi
 
+    # If the leaf is too small to cross-fit, fall back to single-model DR-GLM
     if n_splits <= 1 or n < 2 * n_splits:
         clf = LogisticRegression(solver="lbfgs", max_iter=1000)
         clf.fit(U, A)
@@ -77,8 +78,26 @@ def _dr_scores_glm_local(
         A_tr, A_te = A[train_idx], A[test_idx]
         Y_tr, Y_te = Y[train_idx], Y[test_idx]
 
-        # Extreme imbalance inside a fold: skip and rely on other folds/global
         if np.unique(A_tr).size < 2:
+            # Fall back to fitting on the entire leaf to avoid zeroing these test points
+            clf = LogisticRegression(solver="lbfgs", max_iter=1000)
+            clf.fit(U, A)
+            e_hat = clf.predict_proba(U_te)[:, 1].clip(1e-3, 1 - 1e-3)
+
+            X_all = np.column_stack([A, U])
+            reg = LinearRegression().fit(X_all, Y)
+
+            X1 = np.column_stack([np.ones_like(A_te), U_te])
+            X0 = np.column_stack([np.zeros_like(A_te), U_te])
+            m1_hat = reg.predict(X1)
+            m0_hat = reg.predict(X0)
+
+            psi[test_idx] = (
+                m1_hat
+                - m0_hat
+                + A_te * (Y_te - m1_hat) / e_hat
+                - (1 - A_te) * (Y_te - m0_hat) / (1 - e_hat)
+            )
             continue
 
         clf = LogisticRegression(solver="lbfgs", max_iter=1000)
