@@ -103,6 +103,23 @@ class _Adversary(nn.Module):
         return self.net(z).squeeze(-1)
 
 
+class _ScalarRegHead(nn.Module):
+    """Simple scalar regression head (used for consistency)."""
+
+    def __init__(self, latent_dim: int, hidden: Sequence[int]):
+        super().__init__()
+        layers: list[nn.Module] = []
+        last = latent_dim
+        for h in hidden:
+            layers.extend([nn.Linear(last, h), nn.ReLU()])
+            last = h
+        layers.append(nn.Linear(last, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z).squeeze(-1)
+
+
 def _standardize(train: np.ndarray, min_std: float = 1e-2):
     mean = train.mean(axis=0, keepdims=True)
     std = train.std(axis=0, keepdims=True)
@@ -132,18 +149,35 @@ def _padic_ultrametric_loss(Uc: torch.Tensor, num_triplets: int = 128) -> torch.
     return torch.mean(viol**2)
 
 
-def _orthogonal_penalty(blocks: list[torch.Tensor]) -> torch.Tensor:
-    """Penalize cross-covariance between latent blocks to encourage orthogonality."""
-    if len(blocks) < 2:
-        return torch.zeros((), device=blocks[0].device)
+def _conditional_orthogonal_penalty(
+    blocks: list[torch.Tensor], U: torch.Tensor
+) -> torch.Tensor:
+    """Approximate I(T_i; T_j | U) ≈ 0 using residual cross-covariance.
 
-    penalty = torch.zeros((), device=blocks[0].device)
+    For each block pair (T_i, T_j), regress them on U via least squares,
+    take residuals, and penalize their empirical cross-covariance.
+    """
+
+    if len(blocks) < 2:
+        return torch.zeros((), device=U.device)
+
+    penalty = torch.zeros((), device=U.device)
     for i in range(len(blocks)):
         for j in range(i + 1, len(blocks)):
-            bi = blocks[i] - blocks[i].mean(dim=0, keepdim=True)
-            bj = blocks[j] - blocks[j].mean(dim=0, keepdim=True)
-            cov = bi.T @ bj / bi.shape[0]
+            Ti = blocks[i]
+            Tj = blocks[j]
+
+            sol_i = torch.linalg.lstsq(U, Ti).solution
+            sol_j = torch.linalg.lstsq(U, Tj).solution
+
+            resid_i = Ti - U @ sol_i
+            resid_j = Tj - U @ sol_j
+
+            ri = resid_i - resid_i.mean(dim=0, keepdim=True)
+            rj = resid_j - resid_j.mean(dim=0, keepdim=True)
+            cov = ri.T @ rj / ri.shape[0]
             penalty = penalty + (cov**2).mean()
+
     return penalty
 
 
@@ -183,6 +217,10 @@ class IVAPCIV32HierConfig:
     adv_w_hidden: Sequence[int] = (32,)
     adv_z_hidden: Sequence[int] = (32,)
     adv_n_hidden: Sequence[int] = (64,)
+
+    # consistency heads (T_W -> Y, T_Z -> A)
+    consistency_hidden: Sequence[int] = (32,)
+    lambda_consistency: float = 0.05
 
     # loss weights
     lambda_recon: float = 1.0
@@ -277,6 +315,8 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
         self.proxy_decoder = _ProxyDecoder(total_latent, d_all, cfg.decoder_hidden).to(self.device)
         self.a_head = _AHead(total_c_dim, cfg.a_hidden).to(self.device)
         self.y_head = _YHead(total_c_dim, cfg.y_hidden).to(self.device)
+        self.cons_y_from_w = _ScalarRegHead(cfg.latent_w_dim, cfg.consistency_hidden).to(self.device)
+        self.cons_a_from_z = _AHead(cfg.latent_z_dim, cfg.consistency_hidden).to(self.device)
 
         self.adv_w = _Adversary(cfg.latent_w_dim, cfg.adv_w_hidden).to(self.device)
         self.adv_z = _Adversary(cfg.latent_z_dim, cfg.adv_z_hidden).to(self.device)
@@ -290,6 +330,8 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
             + list(self.proxy_decoder.parameters())
             + list(self.a_head.parameters())
             + list(self.y_head.parameters())
+            + list(self.cons_y_from_w.parameters())
+            + list(self.cons_a_from_z.parameters())
         )
         self.main_opt = torch.optim.Adam(main_params, lr=cfg.lr_main)
         self.adv_opt_w = torch.optim.Adam(self.adv_w.parameters(), lr=cfg.lr_adv)
@@ -328,7 +370,7 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
             adv_z_pred = self.adv_z(tz)
             adv_n_logits = self.adv_n(tn)
 
-            ortho = _orthogonal_penalty([tx, tw, tz])
+            ortho = _conditional_orthogonal_penalty([tx, tw, tz], Uc)
             padic = _padic_ultrametric_loss(Uc)
 
             return (
@@ -340,6 +382,11 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
                 adv_n_logits,
                 ortho,
                 padic,
+                tx,
+                tw,
+                tz,
+                tn,
+                Uc,
             )
 
         # ---------- Stage 0: reconstruction + orthogonality + p-adic ----------
@@ -356,7 +403,7 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
                 ab = ab.to(self.device)
                 yb = yb.to(self.device)
 
-                x_recon, _, _, _, _, _, ortho, padic = forward_blocks(xb, ab, yb)
+                x_recon, _, _, _, _, _, ortho, padic, *_ = forward_blocks(xb, ab, yb)
                 loss = (
                     cfg.lambda_recon * mse_loss(x_recon, xb)
                     + cfg.lambda_ortho * ortho
@@ -381,6 +428,8 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
             self.proxy_decoder.train()
             self.a_head.train()
             self.y_head.train()
+            self.cons_y_from_w.train()
+            self.cons_a_from_z.train()
             self.adv_w.train()
             self.adv_z.train()
             self.adv_n.train()
@@ -428,7 +477,16 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
                     adv_n_logits,
                     ortho,
                     padic,
+                    tx,
+                    tw,
+                    tz,
+                    _tn,
+                    _Uc,
                 ) = forward_blocks(xb, ab, yb)
+
+                y_from_w = self.cons_y_from_w(tw)
+                a_from_z_logits = self.cons_a_from_z(tz)
+                consistency_loss = mse_loss(y_from_w, yb) + bce_loss(a_from_z_logits, ab)
 
                 loss_main = (
                     cfg.lambda_recon * mse_loss(x_recon, xb)
@@ -439,6 +497,7 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
                     - cfg.gamma_adv_w * bce_loss(adv_w_logits, ab)
                     - cfg.gamma_adv_z * mse_loss(adv_z_pred, yb)
                     - cfg.gamma_adv_n * bce_loss(adv_n_logits, ab)
+                    + cfg.lambda_consistency * consistency_loss
                 )
 
                 self.main_opt.zero_grad()
@@ -453,6 +512,8 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
             self.proxy_decoder.eval()
             self.a_head.eval()
             self.y_head.eval()
+            self.cons_y_from_w.eval()
+            self.cons_a_from_z.eval()
 
             val_losses: list[float] = []
             with torch.no_grad():
@@ -461,7 +522,17 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
                     ab = ab.to(self.device)
                     yb = yb.to(self.device)
 
-                    x_recon, logits_a, y_pred, _, _, _, ortho, padic = forward_blocks(xb, ab, yb)
+                    (
+                        x_recon,
+                        logits_a,
+                        y_pred,
+                        _advw,
+                        _advz,
+                        _advn,
+                        ortho,
+                        padic,
+                        *_rest,
+                    ) = forward_blocks(xb, ab, yb)
                     loss_val = (
                         cfg.lambda_recon * mse_loss(x_recon, xb)
                         + cfg.lambda_a * bce_loss(logits_a, ab)
@@ -483,6 +554,8 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
                     "decoder": self.proxy_decoder.state_dict(),
                     "a_head": self.a_head.state_dict(),
                     "y_head": self.y_head.state_dict(),
+                    "cons_y_from_w": self.cons_y_from_w.state_dict(),
+                    "cons_a_from_z": self.cons_a_from_z.state_dict(),
                     "adv_w": self.adv_w.state_dict(),
                     "adv_z": self.adv_z.state_dict(),
                     "adv_n": self.adv_n.state_dict(),
@@ -501,6 +574,8 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
                 "decoder": self.proxy_decoder.state_dict(),
                 "a_head": self.a_head.state_dict(),
                 "y_head": self.y_head.state_dict(),
+                "cons_y_from_w": self.cons_y_from_w.state_dict(),
+                "cons_a_from_z": self.cons_a_from_z.state_dict(),
                 "adv_w": self.adv_w.state_dict(),
                 "adv_z": self.adv_z.state_dict(),
                 "adv_n": self.adv_n.state_dict(),
@@ -513,6 +588,8 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
         self.proxy_decoder.load_state_dict(best_state["decoder"])
         self.a_head.load_state_dict(best_state["a_head"])
         self.y_head.load_state_dict(best_state["y_head"])
+        self.cons_y_from_w.load_state_dict(best_state["cons_y_from_w"])
+        self.cons_a_from_z.load_state_dict(best_state["cons_a_from_z"])
         self.adv_w.load_state_dict(best_state["adv_w"])
         self.adv_z.load_state_dict(best_state["adv_z"])
         self.adv_n.load_state_dict(best_state["adv_n"])
