@@ -30,6 +30,7 @@ class ScenarioSpec:
     sparse_signal: bool = False
     heavy_tail_latent: bool = False
     mixture_latent: bool = False
+    low_variance_proxy: bool = False
 
 
 SCENARIOS: Dict[str, ScenarioSpec] = {
@@ -71,6 +72,21 @@ SCENARIOS: Dict[str, ScenarioSpec] = {
         hetero_tau=True,
         misaligned_proxies=True,
         sparse_signal=True,
+    ),
+    "HARD-nonlinear-extreme-low-var-proxy": ScenarioSpec(
+        name="HARD-nonlinear-extreme-low-var-proxy",
+        d_u=4,
+        d_x=14,
+        d_w=10,
+        d_z=10,
+        gamma=2.0,
+        nonlinear=True,
+        strong_nonlinear=True,
+        weak_overlap=True,
+        hetero_tau=True,
+        misaligned_proxies=True,
+        sparse_signal=True,
+        low_variance_proxy=True,
     ),
     "HARD-nonlinear-extreme-heavy-tail": ScenarioSpec(
         name="HARD-nonlinear-extreme-heavy-tail",
@@ -257,6 +273,10 @@ def _generate_proxies(
         X += 0.3 * np.sin(U @ rng.normal(size=(d_u, spec.d_x)))
         W += 0.3 * np.tanh(U @ rng.normal(size=(d_u, spec.d_w)))
         Z += 0.3 * np.sin(U @ rng.normal(size=(d_u, spec.d_z)))
+
+    if spec.low_variance_proxy:
+        rare = (rng.uniform(size=(U.shape[0], 1)) < 0.02).astype(float)
+        X = np.concatenate([X, rare * 0.01], axis=1)
 
     return X, W, Z
 

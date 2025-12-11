@@ -75,6 +75,7 @@ def simulate_scenario(
 * `"HARD-nonlinear-extreme"`：极强非线性 + 弱重叠 + 异质效应（可配合 `variant="weak_proxies"` 打造“地狱模式”）
 * `"HARD-nonlinear-extreme-heavy-tail"`：在 extreme 基础上使用 heavy-tail latent（t 分布），检验几何正则对尾部样本的鲁棒性。
 * `"HARD-nonlinear-extreme-mixture"`：在 extreme 基础上使用 mixture-of-Gaussians latent，形成明显簇结构，观察 PACD/ultrametric 的适配性。
+* `"HARD-nonlinear-extreme-low-var-proxy"`：在 extreme 基础上额外拼接极低方差、稀有激活的 proxy 维度，用于检验预处理/正则是否会错误压缩掉确定性信号通道。
 * `"HARD-nonlinear-weak-overlap"`：仅打开弱重叠（极端倾向评分），其他结构与 HARD-strong 相同。
 * `"HARD-nonlinear-hetero-tau"`：仅打开异质处理效应 τ(U) 的强非线性，其余保持 HARD-strong。
 * `"HARD-nonlinear-misaligned-proxies"`：仅打开 proxy 错配/稀疏信号（A 和 Y 的最佳 proxy 方向不同），用于测试表示分解的失效模式。

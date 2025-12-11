@@ -70,6 +70,9 @@ class InformationLossMonitor:
 
 @dataclass
 class IVAPCIV31TheoryConfig(IVAPCIV31Config):
+    # Use a smaller clamp than the base encoder to retain more variance in
+    # near-deterministic proxy channels, ensuring the theory-aware variant
+    # behaves differently from the default preprocessing.
     min_std: float = 1e-2
 
 
