@@ -22,8 +22,8 @@ from .ivapci_v31_pacd_encoder import (
     IVAPCIV31Config,
     IVAPCIv31RADREstimator,
     _apply_standardize,
-    _standardize,
 )
+from . import ivapci_v31_pacd_encoder as _base_mod
 
 
 def _info_aware_standardize(
@@ -83,19 +83,36 @@ class IVAPCIv31TheoryRADREstimator(IVAPCIv31RADREstimator):
         self.training_diagnostics: dict = {}
 
     def fit(self, X_all: np.ndarray, A: np.ndarray, Y: np.ndarray) -> None:
-        # Apply theory-aware standardization before delegating to the base fit.
         X_all = np.asarray(X_all, dtype=np.float32)
-        X_std, self._x_mean, self._x_std, protected = _info_aware_standardize(
-            X_all, min_std=self.config.min_std
-        )
-        self._protected_mask = protected
-        # Reuse the parent training pipeline by temporarily calling the shared
-        # standardizer signature.
-        super().fit(X_std, A, Y)
+        # Hook the base standardizer so the parent fit uses the info-aware path.
+        orig_standardize = _base_mod._standardize
+
+        def _std_wrapper(train: np.ndarray):
+            X_std, mean, std, protected = _info_aware_standardize(
+                train, min_std=self.config.min_std
+            )
+            if (
+                train.ndim == 2
+                and train.shape[1] > 1
+                and self._protected_mask is None
+            ):
+                self._protected_mask = protected
+            return X_std, mean, std
+
+        _base_mod._standardize = _std_wrapper
+        try:
+            super().fit(X_all, A, Y)
+        finally:
+            _base_mod._standardize = orig_standardize
+
+        if self._protected_mask is None:
+            self._protected_mask = np.zeros(X_all.shape[1], dtype=bool)
 
         # After training, record reconstruction-based information-loss signals.
         self.training_diagnostics = self.info_monitor.estimate(self, X_all)
-        self.training_diagnostics["protected_features"] = int(np.sum(protected))
+        self.training_diagnostics["protected_features"] = int(
+            np.sum(self._protected_mask)
+        )
 
     def get_training_diagnostics(self) -> dict:
         return self.training_diagnostics
