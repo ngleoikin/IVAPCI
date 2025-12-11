@@ -73,6 +73,11 @@ def simulate_scenario(
 * `"MODERATE-nonlinear"`：适度非线性
 * `"HARD-nonlinear-strong"`：强非线性 + 强混杂
 * `"HARD-nonlinear-extreme"`：极强非线性 + 弱重叠 + 异质效应（可配合 `variant="weak_proxies"` 打造“地狱模式”）
+* `"HARD-nonlinear-extreme-heavy-tail"`：在 extreme 基础上使用 heavy-tail latent（t 分布），检验几何正则对尾部样本的鲁棒性。
+* `"HARD-nonlinear-extreme-mixture"`：在 extreme 基础上使用 mixture-of-Gaussians latent，形成明显簇结构，观察 PACD/ultrametric 的适配性。
+* `"HARD-nonlinear-weak-overlap"`：仅打开弱重叠（极端倾向评分），其他结构与 HARD-strong 相同。
+* `"HARD-nonlinear-hetero-tau"`：仅打开异质处理效应 τ(U) 的强非线性，其余保持 HARD-strong。
+* `"HARD-nonlinear-misaligned-proxies"`：仅打开 proxy 错配/稀疏信号（A 和 Y 的最佳 proxy 方向不同），用于测试表示分解的失效模式。
 
 每个场景都需在模拟代码中**显式给出**：
 
@@ -113,6 +118,16 @@ def simulate_scenario(
   (A, Y) 中含有多项式/交互/非平滑非线性，混杂很强。
 * `HARD-nonlinear-extreme`：
   在强非线性的基础上增加弱重叠（极端倾向评分）、错配/稀疏 proxy 结构和异质处理效应，可与 `variant="weak_proxies"` 组合形成更高难度。
+* `HARD-nonlinear-extreme-heavy-tail`：
+  在 extreme 的生成式上替换 heavy-tail latent（t 分布），极端样本更多，考验几何正则的鲁棒性。
+* `HARD-nonlinear-extreme-mixture`：
+  在 extreme 的生成式上使用 mixture-of-Gaussians latent，突出簇结构，匹配 PACD/p-adic 的层级几何假设。
+* `HARD-nonlinear-weak-overlap`：
+  仅打开弱重叠开关（极端倾向评分），其余结构与 HARD-strong 相同，用于隔离“重叠性”对 DR 方差的影响。
+* `HARD-nonlinear-hetero-tau`：
+  仅打开异质 τ(U) 的强非线性，其余保持 HARD-strong，专注评估“非线性效应”对 nuisance misspec 的影响。
+* `HARD-nonlinear-misaligned-proxies`：
+  仅打开 proxy 错配 + 稀疏信号（A 与 Y 依赖的 proxy 子空间不同），用于测试 U_c/U_n 分解在 proxy 错配下的稳健性。
 
 #### 1.1.3 proxy & 混杂暴露的多种 variant
 
@@ -242,7 +257,9 @@ benchmark 与 diagnostics 只调用统一接口，不涉及内部实现。
 #### 3.1.1 输入
 
 * 场景列表：`["EASY-linear-weak", "EASY-linear-strong", "MODERATE-nonlinear", "HARD-nonlinear-strong"]`
-  （如需更高难度，可加入 `"HARD-nonlinear-extreme"`）
+  扩展选项：`"HARD-nonlinear-extreme"` 及其 latent 变体（heavy-tail / mixture），
+  以及单因素拆分场景：`"HARD-nonlinear-weak-overlap"`, `"HARD-nonlinear-hetero-tau"`,
+  `"HARD-nonlinear-misaligned-proxies"`（可组合 `variant="weak_proxies"` 形成更极端设置）。
 * 每个场景的样本量、重复次数、起始 seed
 * 使用的 methods 列表：`["naive", "dr_glm", "dr_rf", "oracle_U", "ivapci_v2_1", "pacdt_v3_0"]`
 * 是否保存中间 latent 可视化（可选）
