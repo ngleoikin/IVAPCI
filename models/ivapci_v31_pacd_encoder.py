@@ -15,10 +15,18 @@ from sklearn.model_selection import KFold, train_test_split
 from . import BaseCausalEstimator
 
 
-def _standardize(train: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _standardize(train: np.ndarray, min_std: float = 1e-2) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Standardize features while protecting near-constant dimensions.
+
+    The previous implementation replaced zero-variance columns with unit scale,
+    which can discard deterministic proxy signal. The updated version clamps the
+    standard deviation to a small positive value so that low-variance features
+    are retained instead of flattened.
+    """
+
     mean = train.mean(axis=0, keepdims=True)
     std = train.std(axis=0, keepdims=True)
-    std[std == 0] = 1.0
+    std = np.maximum(std, min_std)
     return (train - mean) / std, mean, std
 
 

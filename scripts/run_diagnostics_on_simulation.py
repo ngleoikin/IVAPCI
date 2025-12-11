@@ -27,6 +27,7 @@ from models.ivapci_gold import IVAPCIGoldEstimator
 from models.ivapci_v21 import IVAPCIv21Estimator, IVAPCIv21GLMEstimator, IVAPCIv21RADREstimator
 from models.ivapci_v2_1_pacd_glm import IVAPCIPACDTGLMEstimator
 from models.ivapci_v31_pacd_encoder import IVAPCIv31PACDEncoderEstimator, IVAPCIv31RADREstimator
+from models.ivapci_v31_theory import IVAPCIv31TheoryRADREstimator
 from models.pacdt_v30 import PACDTv30Estimator
 from simulators.simulators import list_scenarios, simulate_scenario
 
@@ -52,6 +53,8 @@ def _build_estimator(name: str):
         return IVAPCIv31PACDEncoderEstimator()
     if name == "ivapci_v3_1_radr":
         return IVAPCIv31RADREstimator()
+    if name == "ivapci_v3_1_radr_theory":
+        return IVAPCIv31TheoryRADREstimator()
     if name == "ivapci_gold":
         return IVAPCIGoldEstimator()
     if name == "pacdt_v3_0":
@@ -191,6 +194,7 @@ def run_diagnostics(
                     "ivapci_v2_1_pacd_glm",
                     "ivapci_v3_1_pacd",
                     "ivapci_v3_1_radr",
+                    "ivapci_v3_1_radr_theory",
                     "ivapci_gold",
                 }:
                     row["subspace_r2_ivapci"] = _latent_r2(data["U"], latent)
@@ -212,6 +216,8 @@ def run_diagnostics(
                     iv_latent = latent_store.get("ivapci_v3_1_pacd")
                 if iv_latent is None:
                     iv_latent = latent_store.get("ivapci_v3_1_radr")
+                if iv_latent is None:
+                    iv_latent = latent_store.get("ivapci_v3_1_radr_theory")
                 if iv_latent is None:
                     iv_latent = latent_store.get("ivapci_gold")
 
@@ -263,6 +269,7 @@ def parse_args() -> argparse.Namespace:
             "ivapci_v2_1_pacd_glm",
             "ivapci_v3_1_pacd",
             "ivapci_v3_1_radr",
+            "ivapci_v3_1_radr_theory",
             "ivapci_gold",
             "pacdt_v3_0",
         ],
