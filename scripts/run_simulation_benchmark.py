@@ -83,6 +83,58 @@ def _latent_r2(U_true: np.ndarray, U_hat: np.ndarray) -> float:
     return float(1 - ss_res / ss_tot)
 
 
+def _normalize_scenarios(raw: List[str]) -> List[str]:
+    """Normalize scenario names, supporting comma-delimited and accidental concatenation.
+
+    Users sometimes concatenate scenario tokens when shell line breaks miss a trailing space
+    (e.g., "HARD-nonlinear-strongHARD-nonlinear-extreme"). This helper attempts to recover
+    such cases by greedily matching known scenario names from the registry. It also splits
+    comma-delimited inputs for convenience.
+    """
+
+    available = list(list_scenarios().keys())
+    normalized: List[str] = []
+
+    for token in raw:
+        # First split on commas and strip whitespace.
+        parts = [p.strip() for p in token.split(",") if p.strip()]
+        for part in parts:
+            if part in available:
+                normalized.append(part)
+                continue
+
+            # Attempt to decompose concatenated scenario names greedily by prefix.
+            pos = 0
+            matched_any = False
+            while pos < len(part):
+                match = None
+                for name in sorted(available, key=len, reverse=True):
+                    if part.startswith(name, pos):
+                        match = name
+                        break
+                if match is None:
+                    break
+                matched_any = True
+                normalized.append(match)
+                pos += len(match)
+
+            if pos != len(part):
+                raise ValueError(
+                    f"Unknown scenario '{part}'. Available: {available}. "
+                    "Ensure scenario names are space- or comma-separated."
+                )
+
+            if matched_any:
+                continue
+
+            raise ValueError(
+                f"Unknown scenario '{part}'. Available: {available}. "
+                "Ensure scenario names are space- or comma-separated."
+            )
+
+    return normalized
+
+
 def run_benchmark(
     scenarios: List[str],
     n_samples: int,
@@ -211,6 +263,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.scenarios = _normalize_scenarios(args.scenarios)
     outdir = Path(args.outdir) if args.outdir else None
     if outdir:
         outdir.mkdir(parents=True, exist_ok=True)
