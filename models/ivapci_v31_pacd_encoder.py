@@ -403,10 +403,10 @@ class IVAPCIv31PACDEncoderEstimator(BaseCausalEstimator):
         if not self._is_fit:
             raise RuntimeError("Estimator must be fit before estimating ATE.")
         U_c = self.get_latent(X_all)
-        return self._dr_ate_glm(U_c, A, Y)
+        return self._dr_ate(U_c, A, Y)
 
     # -------------------- DR / DML --------------------
-    def _dr_ate_glm(self, U: np.ndarray, A: np.ndarray, Y: np.ndarray) -> float:
+    def _dr_ate(self, U: np.ndarray, A: np.ndarray, Y: np.ndarray) -> float:
         cfg = self.config
         U = np.asarray(U)
         A = np.asarray(A).reshape(-1)
