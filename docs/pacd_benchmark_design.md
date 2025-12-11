@@ -263,7 +263,7 @@ benchmark 与 diagnostics 只调用统一接口，不涉及内部实现。
   以及单因素拆分场景：`"HARD-nonlinear-weak-overlap"`, `"HARD-nonlinear-hetero-tau"`,
   `"HARD-nonlinear-misaligned-proxies"`（可组合 `variant="weak_proxies"` 形成更极端设置）。
 * 每个场景的样本量、重复次数、起始 seed
-* 使用的 methods 列表：`["naive", "dr_glm", "dr_rf", "oracle_U", "ivapci_v2_1", "pacdt_v3_0"]`
+* 使用的 methods 列表：`["naive", "dr_glm", "dr_rf", "oracle_U", "ivapci_v2_1", "ivapci_v2_1_glm", "ivapci_v2_1_radr", "ivapci_v2_1_pacd_glm", "ivapci_v3_1_pacd", "ivapci_v3_1_radr", "ivapci_v3_2_hier", "ivapci_v3_2_hier_radr", "pacdt_v3_0"]`
 * 是否保存中间 latent 可视化（可选）
 
 #### 3.1.2 输出

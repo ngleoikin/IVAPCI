@@ -54,8 +54,13 @@ python smoke_test.py
   - `full_proxies`（默认）
   - `weak_proxies` / `missing_Z` / `missing_W` / `partial_X`
 
+> IVAPCI v3.2 使用提示
+> - 新增的 `ivapci_v3_2_hier` 与 `ivapci_v3_2_hier_radr` 采用分层编码器（X/W/Z 各自头部 + 正交融合 + 分层对抗 + p-adic 正则）。
+> - 这两个方法在脚本中自动根据 `[X|W|Z]` 的列划分推断 `x_dim/w_dim/z_dim`，只需像示例命令那样传入方法名即可。
+> - RADR 版本在表示基础上做头部校准，适合与 GLM/RF 结果并行对比。
+
 > 推荐测试组合
-> 1) **冒烟**：`--scenarios EASY-linear-weak --n 200 --seeds 0`，方法用 `naive ivapci_v2_1 ivapci_v2_1_glm ivapci_v2_1_radr ivapci_v2_1_pacd_glm ivapci_v3_1_pacd ivapci_v3_1_radr ivapci_gold` 对比 RF/GLM/分段 DR。
+> 1) **冒烟**：`--scenarios EASY-linear-weak --n 200 --seeds 0`，方法用 `naive ivapci_v2_1 ivapci_v2_1_glm ivapci_v2_1_radr ivapci_v2_1_pacd_glm ivapci_v3_1_pacd ivapci_v3_1_radr ivapci_v3_2_hier ivapci_v3_2_hier_radr ivapci_gold` 对比 RF/GLM/分段 DR。
 > 2) **小规模回归测试**（示例命令见下文 4.1/4.2）。
 > 3) **完整回归测试**：全部四个场景、`--n 1000`、`--seeds 0 1 2 3 4`，方法全开，运行时间较长但覆盖全面。
 
@@ -65,7 +70,7 @@ python scripts/run_simulation_benchmark.py \
   --scenarios EASY-linear-weak EASY-linear-strong \
   --seeds 0 1 \
   --n 200 \
-  --methods naive dr_glm dr_rf oracle_U ivapci_v2_1 ivapci_v2_1_glm ivapci_v2_1_radr ivapci_v2_1_pacd_glm ivapci_v3_1_pacd ivapci_v3_1_radr ivapci_v3_1_radr_theory ivapci_gold pacdt_v3_0 \
+  --methods naive dr_glm dr_rf oracle_U ivapci_v2_1 ivapci_v2_1_glm ivapci_v2_1_radr ivapci_v2_1_pacd_glm ivapci_v3_1_pacd ivapci_v3_1_radr ivapci_v3_1_radr_theory ivapci_v3_2_hier ivapci_v3_2_hier_radr ivapci_gold pacdt_v3_0 \
   --outdir outputs/bench_small
 ```
 > 如果不传 `--seeds`，脚本将使用 `--start-seed` 和 `--repetitions` 自动生成种子序列；默认输出文件为 `simulation_benchmark_results.csv` 与 `simulation_benchmark_summary.csv`，若指定 `--outdir` 会自动写入该目录。
@@ -76,10 +81,10 @@ python scripts/run_simulation_benchmark.py \
 ### 4.2 诊断分析（基于上一步输出）
 ```bash
  python scripts/run_diagnostics_on_simulation.py \
-  --scenarios EASY-linear-weak EASY-linear-strong \
+ --scenarios EASY-linear-weak EASY-linear-strong \
   --seeds 0 1 \
   --n 200 \
-  --methods naive dr_glm dr_rf oracle_U ivapci_v2_1 ivapci_v2_1_glm ivapci_v2_1_radr ivapci_v2_1_pacd_glm ivapci_v3_1_pacd ivapci_v3_1_radr ivapci_v3_1_radr_theory ivapci_gold pacdt_v3_0 \
+  --methods naive dr_glm dr_rf oracle_U ivapci_v2_1 ivapci_v2_1_glm ivapci_v2_1_radr ivapci_v2_1_pacd_glm ivapci_v3_1_pacd ivapci_v3_1_radr ivapci_v3_1_radr_theory ivapci_v3_2_hier ivapci_v3_2_hier_radr ivapci_gold pacdt_v3_0 \
   --outdir outputs/diag_small
 ```
 > 同样地，如未提供 `--seeds`，会使用 `--start-seed` 和 `--repetitions`；诊断结果默认写入 `simulation_diagnostics_results.csv`，若传 `--outdir` 将放在指定目录。
