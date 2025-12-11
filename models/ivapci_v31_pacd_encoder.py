@@ -231,7 +231,7 @@ class IVAPCIv31PACDEncoderEstimator(BaseCausalEstimator):
             + list(self.y_head.parameters())
         )
         self.main_opt = torch.optim.Adam(main_params, lr=cfg.lr_main)
-        self.main_sched = ReduceLROnPlateau(self.main_opt, mode="min", factor=0.5, patience=10, verbose=False)
+        self.main_sched = ReduceLROnPlateau(self.main_opt, mode="min", factor=0.5, patience=10)
         self.adv_opt = torch.optim.Adam(self.adv_head.parameters(), lr=cfg.lr_adv)
         bce_loss = nn.BCEWithLogitsLoss()
         mse_loss = nn.MSELoss()
