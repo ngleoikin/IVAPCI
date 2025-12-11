@@ -72,6 +72,7 @@ def simulate_scenario(
 * `"EASY-linear-strong"`：线性、强混杂
 * `"MODERATE-nonlinear"`：适度非线性
 * `"HARD-nonlinear-strong"`：强非线性 + 强混杂
+* `"HARD-nonlinear-extreme"`：极强非线性 + 弱重叠 + 异质效应（可配合 `variant="weak_proxies"` 打造“地狱模式”）
 
 每个场景都需在模拟代码中**显式给出**：
 
@@ -110,6 +111,8 @@ def simulate_scenario(
   (A) 用 logistic + 少量非线性项，(Y) 用平滑非线性；
 * `HARD-nonlinear-strong`：
   (A, Y) 中含有多项式/交互/非平滑非线性，混杂很强。
+* `HARD-nonlinear-extreme`：
+  在强非线性的基础上增加弱重叠（极端倾向评分）、错配/稀疏 proxy 结构和异质处理效应，可与 `variant="weak_proxies"` 组合形成更高难度。
 
 #### 1.1.3 proxy & 混杂暴露的多种 variant
 
@@ -239,6 +242,7 @@ benchmark 与 diagnostics 只调用统一接口，不涉及内部实现。
 #### 3.1.1 输入
 
 * 场景列表：`["EASY-linear-weak", "EASY-linear-strong", "MODERATE-nonlinear", "HARD-nonlinear-strong"]`
+  （如需更高难度，可加入 `"HARD-nonlinear-extreme"`）
 * 每个场景的样本量、重复次数、起始 seed
 * 使用的 methods 列表：`["naive", "dr_glm", "dr_rf", "oracle_U", "ivapci_v2_1", "pacdt_v3_0"]`
 * 是否保存中间 latent 可视化（可选）

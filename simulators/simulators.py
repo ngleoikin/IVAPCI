@@ -24,6 +24,12 @@ class ScenarioSpec:
     gamma: float
     nonlinear: bool = False
     strong_nonlinear: bool = False
+    weak_overlap: bool = False
+    hetero_tau: bool = False
+    misaligned_proxies: bool = False
+    sparse_signal: bool = False
+    heavy_tail_latent: bool = False
+    mixture_latent: bool = False
 
 
 SCENARIOS: Dict[str, ScenarioSpec] = {
@@ -51,6 +57,20 @@ SCENARIOS: Dict[str, ScenarioSpec] = {
         gamma=1.4,
         nonlinear=True,
         strong_nonlinear=True,
+    ),
+    "HARD-nonlinear-extreme": ScenarioSpec(
+        name="HARD-nonlinear-extreme",
+        d_u=4,
+        d_x=14,
+        d_w=10,
+        d_z=10,
+        gamma=2.0,
+        nonlinear=True,
+        strong_nonlinear=True,
+        weak_overlap=True,
+        hetero_tau=True,
+        misaligned_proxies=True,
+        sparse_signal=True,
     ),
 }
 
@@ -92,7 +112,7 @@ def simulate_scenario(
     rng = np.random.default_rng(seed)
     spec = SCENARIOS[scenario]
 
-    U = rng.normal(size=(n, spec.d_u))
+    U = _sample_latent(n, spec, rng)
 
     X, W, Z = _generate_proxies(U, spec, rng, variant)
 
@@ -135,6 +155,7 @@ def _generate_proxies(
         raise ValueError(f"Unsupported variant '{variant}'.")
 
     d_u = spec.d_u
+    # base weights
     X_weights = rng.normal(scale=signal_scale, size=(d_u, spec.d_x))
     W_weights = rng.normal(scale=signal_scale, size=(d_u, spec.d_w))
     Z_weights = rng.normal(scale=signal_scale, size=(d_u, spec.d_z))
@@ -143,9 +164,30 @@ def _generate_proxies(
     W_noise = rng.normal(scale=noise_scale, size=(U.shape[0], spec.d_w))
     Z_noise = rng.normal(scale=noise_scale, size=(U.shape[0], spec.d_z))
 
-    X = U @ X_weights + X_noise
-    W = U @ W_weights + W_noise
-    Z = U @ Z_weights + Z_noise
+    if spec.misaligned_proxies:
+        # X leans toward treatment-related signals, W leans toward outcome-related signals.
+        treat_weights = rng.normal(scale=signal_scale * 1.2, size=(d_u, spec.d_x))
+        outcome_weights = rng.normal(scale=signal_scale * 1.2, size=(d_u, spec.d_w))
+        X = U @ treat_weights + X_noise
+        W = U @ outcome_weights + W_noise
+        # Z mixes a few treatment-aligned dimensions with mostly noisy ones
+        z_signal_dims = max(1, spec.d_z // 3)
+        Z = U @ Z_weights
+        Z[:, z_signal_dims:] = rng.normal(scale=noise_scale, size=(U.shape[0], spec.d_z - z_signal_dims))
+        Z += Z_noise
+    else:
+        X = U @ X_weights + X_noise
+        W = U @ W_weights + W_noise
+        Z = U @ Z_weights + Z_noise
+
+    if spec.sparse_signal:
+        # Only a subset of dimensions carry confounding signal; remaining dimensions are pure noise.
+        sig_x = max(1, spec.d_x // 3)
+        sig_w = max(1, spec.d_w // 3)
+        sig_z = max(1, spec.d_z // 3)
+        X[:, sig_x:] = rng.normal(scale=noise_scale, size=(U.shape[0], spec.d_x - sig_x))
+        W[:, sig_w:] = rng.normal(scale=noise_scale, size=(U.shape[0], spec.d_w - sig_w))
+        Z[:, sig_z:] = rng.normal(scale=noise_scale, size=(U.shape[0], spec.d_z - sig_z))
 
     if spec.nonlinear:
         X += 0.3 * np.sin(U @ rng.normal(size=(d_u, spec.d_x)))
@@ -153,6 +195,20 @@ def _generate_proxies(
         Z += 0.3 * np.sin(U @ rng.normal(size=(d_u, spec.d_z)))
 
     return X, W, Z
+
+
+def _sample_latent(n: int, spec: ScenarioSpec, rng: np.random.Generator) -> np.ndarray:
+    """Sample latent confounders with optional mixture or heavy-tail structures."""
+
+    if spec.mixture_latent:
+        centers = np.array([[1.0] * spec.d_u, [-1.0] * spec.d_u])
+        assignments = rng.integers(0, 2, size=n)
+        U = centers[assignments] + rng.normal(scale=0.5, size=(n, spec.d_u))
+    elif spec.heavy_tail_latent:
+        U = rng.standard_t(df=3.0, size=(n, spec.d_u))
+    else:
+        U = rng.normal(size=(n, spec.d_u))
+    return U
 
 
 def _treatment_logit(
@@ -172,6 +228,11 @@ def _treatment_logit(
         logits += 0.3 * np.sin(z_part) + 0.2 * np.tanh(x_part)
     if spec.strong_nonlinear:
         logits += 0.25 * np.sin(np.sum(U, axis=1) * np.sum(Z, axis=1))
+
+    # Weak-overlap branch: deliberately push e close to 0 or 1.
+    if spec.weak_overlap:
+        gate = np.sum(U[:, : min(2, spec.d_u)] * Z[:, : min(2, spec.d_z)], axis=1)
+        logits += 2.5 * np.tanh(gate)
 
     return logits
 
@@ -196,6 +257,10 @@ def _potential_outcomes(
         w_part += 0.1 * (X[:, 0] * W[:, 0])
 
     treatment_effect = 1.5 if spec.strong_nonlinear else 1.0
+
+    if spec.hetero_tau:
+        hetero_tau = 0.6 * np.sin(U[:, 0] + 0.5 * (U[:, 1] ** 2 if U.shape[1] > 1 else 0.0))
+        treatment_effect = treatment_effect + hetero_tau
 
     noise0 = rng.normal(scale=1.0, size=U.shape[0])
     noise1 = rng.normal(scale=1.0, size=U.shape[0])
