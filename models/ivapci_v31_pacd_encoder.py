@@ -7,6 +7,7 @@ from typing import Iterable, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.model_selection import KFold, train_test_split
@@ -120,10 +121,17 @@ def _reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
 
 
 def _padic_ultrametric_loss(Uc: torch.Tensor, num_triplets: int = 128) -> torch.Tensor:
+    """Lightweight ultrametric regularizer using random triplets.
+
+    Keeps the original triplet semantics while scaling the number of samples to
+    the batch size to avoid excessive memory use on large batches.
+    """
     if Uc.shape[0] < 3:
-        return torch.tensor(0.0, device=Uc.device)
+        return torch.zeros((), device=Uc.device)
+
     n = Uc.shape[0]
-    idx = torch.randint(0, n, (num_triplets, 3), device=Uc.device)
+    t = min(num_triplets, max(1, n // 2))
+    idx = torch.randint(0, n, (t, 3), device=Uc.device)
     u_i = Uc[idx[:, 0]]
     u_j = Uc[idx[:, 1]]
     u_k = Uc[idx[:, 2]]
@@ -148,8 +156,8 @@ class IVAPCIV31Config:
     beta_n: float = 1.0
     lambda_a: float = 0.2
     lambda_y: float = 0.2
-    gamma_adv: float = 1.0
-    gamma_padic: float = 0.02
+    gamma_adv: float = 0.1
+    gamma_padic: float = 0.001
 
     lr_main: float = 1e-3
     lr_adv: float = 1e-3
@@ -223,6 +231,7 @@ class IVAPCIv31PACDEncoderEstimator(BaseCausalEstimator):
             + list(self.y_head.parameters())
         )
         self.main_opt = torch.optim.Adam(main_params, lr=cfg.lr_main)
+        self.main_sched = ReduceLROnPlateau(self.main_opt, mode="min", factor=0.5, patience=10, verbose=False)
         self.adv_opt = torch.optim.Adam(self.adv_head.parameters(), lr=cfg.lr_adv)
         bce_loss = nn.BCEWithLogitsLoss()
         mse_loss = nn.MSELoss()
@@ -348,6 +357,8 @@ class IVAPCIv31PACDEncoderEstimator(BaseCausalEstimator):
                     val_loss, _ = compute_main_loss(xb, ab, yb)
                     val_losses.append(float(val_loss.item()))
             mean_val = float(np.mean(val_losses)) if val_losses else float("inf")
+
+            self.main_sched.step(mean_val)
 
             if mean_val + cfg.early_stopping_min_delta < best_val:
                 best_val = mean_val

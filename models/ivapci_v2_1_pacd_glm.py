@@ -122,6 +122,38 @@ def _dr_scores_glm_local(
     return psi
 
 
+def leafwise_dr_glm_with_fallback(
+    U: np.ndarray,
+    A: np.ndarray,
+    Y: np.ndarray,
+    leaf_ids: np.ndarray,
+    *,
+    min_leaf_for_dr: int,
+    n_splits: int,
+    seed: int,
+) -> np.ndarray:
+    """Compute leafwise DR-GLM scores with a safe global fallback.
+
+    Small or single-arm leaves keep the global DR estimate to avoid noisy or
+    undefined local fits.
+    """
+    psi_global = _dr_scores_glm_local(U, A, Y, n_splits=n_splits, seed=seed)
+    psi = psi_global.copy()
+
+    for leaf in np.unique(leaf_ids):
+        idx = np.where(leaf_ids == leaf)[0]
+        if idx.size < min_leaf_for_dr:
+            continue
+
+        psi_leaf = _dr_scores_glm_local(
+            U[idx], A[idx], Y[idx], n_splits=n_splits, seed=seed + int(leaf)
+        )
+        if np.any(psi_leaf):
+            psi[idx] = psi_leaf
+
+    return psi
+
+
 class IVAPCIPACDTGLMEstimator(BaseCausalEstimator):
     """IVAPCI v2.1 encoder + PACD-T partition + leafwise DR-GLM."""
 
@@ -166,33 +198,15 @@ class IVAPCIPACDTGLMEstimator(BaseCausalEstimator):
         U_hat = self._ivapci_encoder.get_latent(X_all)
         leaf_ids = self._tree.apply(U_hat, A)
 
-        # Global DR-GLM as a stable fallback for small or imbalanced leaves
-        psi_global = _dr_scores_glm_local(
+        psi = leafwise_dr_glm_with_fallback(
             U_hat,
             A,
             Y,
+            leaf_ids,
+            min_leaf_for_dr=self.config.min_leaf_for_dr,
             n_splits=self.config.n_splits,
             seed=self.config.seed,
         )
-        psi = psi_global.copy()
-
-        for leaf in np.unique(leaf_ids):
-            idx = np.where(leaf_ids == leaf)[0]
-            if idx.size < self.config.min_leaf_for_dr:
-                # keep global estimates for small leaves
-                continue
-
-            psi_leaf = _dr_scores_glm_local(
-                U_hat[idx],
-                A[idx],
-                Y[idx],
-                n_splits=self.config.n_splits,
-                seed=self.config.seed + int(leaf),
-            )
-
-            # Only override when we obtained meaningful local scores
-            if np.any(psi_leaf):
-                psi[idx] = psi_leaf
 
         return float(psi.mean())
 
