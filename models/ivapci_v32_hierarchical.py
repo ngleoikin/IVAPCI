@@ -264,6 +264,8 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
         torch.manual_seed(self.config.seed)
         np.random.seed(self.config.seed)
         self._is_fit = False
+        # training/theory diagnostics cache
+        self.training_diagnostics: dict = {}
 
     # -------------- training --------------
 
@@ -596,6 +598,17 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
 
         self._is_fit = True
 
+        # post-training diagnostics (best effort; non-fatal)
+        try:
+            from .ivapci_theory_diagnostics import TheoremComplianceDiagnostics
+
+            diag = TheoremComplianceDiagnostics(self)
+            self.training_diagnostics = diag.run_all_diagnostics(
+                X_all, A, Y, n_recon_features=min(10, X_all.shape[1])
+            )
+        except Exception as exc:  # pragma: no cover - diagnostics best-effort
+            self.training_diagnostics = {"diagnostics_error": str(exc)}
+
     # -------------- latent + DR --------------
 
     def _split_blocks_np(self, X_std: np.ndarray):
@@ -680,6 +693,10 @@ class IVAPCIv32HierEncoderEstimator(BaseCausalEstimator):
             raise RuntimeError("Estimator must be fit before estimating ATE.")
         U_c = self.get_latent(X_all)
         return self._dr_ate(U_c, A, Y)
+
+    def get_training_diagnostics(self) -> dict:
+        """Return theory/training diagnostics captured after fit()."""
+        return getattr(self, "training_diagnostics", {})
 
 
 # ----------------- RADR variant on top of hierarchical encoder -----------------
