@@ -275,8 +275,15 @@ def _generate_proxies(
         Z += 0.3 * np.sin(U @ rng.normal(size=(d_u, spec.d_z)))
 
     if spec.low_variance_proxy:
+        # Low-variance but informative channel: strongly tied to U with tiny scale
+        lv_weights = rng.normal(scale=1.0, size=(spec.d_u, 1))
+        strong_low_var = 0.01 * (U @ lv_weights) + rng.normal(
+            scale=0.002, size=(U.shape[0], 1)
+        )
+        # Rare activation channel: mostly zero but occasionally non-zero
         rare = (rng.uniform(size=(U.shape[0], 1)) < 0.02).astype(float)
-        X = np.concatenate([X, rare * 0.01], axis=1)
+        rare_low_var = rare * 0.01
+        X = np.concatenate([X, strong_low_var, rare_low_var], axis=1)
 
     return X, W, Z
 
