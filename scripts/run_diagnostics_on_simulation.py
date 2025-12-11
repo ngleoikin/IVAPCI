@@ -83,6 +83,44 @@ def _latent_r2(U_true: np.ndarray, U_hat: Optional[np.ndarray]) -> float:
     return float(1 - ss_res / ss_tot)
 
 
+def _normalize_scenarios(raw: List[str]) -> List[str]:
+    """Normalize scenario tokens and recover accidental concatenations.
+
+    Supports comma-delimited inputs and attempts to split concatenated scenario names that
+    arise when shell line continuations miss a trailing space (e.g., "HARD...strongHARD...extreme").
+    """
+
+    available = list(list_scenarios().keys())
+    normalized: List[str] = []
+
+    for token in raw:
+        parts = [p.strip() for p in token.split(",") if p.strip()]
+        for part in parts:
+            if part in available:
+                normalized.append(part)
+                continue
+
+            pos = 0
+            while pos < len(part):
+                match = None
+                for name in sorted(available, key=len, reverse=True):
+                    if part.startswith(name, pos):
+                        match = name
+                        break
+                if match is None:
+                    break
+                normalized.append(match)
+                pos += len(match)
+
+            if pos != len(part):
+                raise ValueError(
+                    f"Unknown scenario '{part}'. Available: {available}. "
+                    "Ensure scenario names are separated by spaces or commas."
+                )
+
+    return normalized
+
+
 def run_diagnostics(
     scenarios: List[str],
     n_samples: int,
@@ -243,6 +281,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.scenarios = _normalize_scenarios(args.scenarios)
     outdir = Path(args.outdir) if args.outdir else None
     if outdir:
         outdir.mkdir(parents=True, exist_ok=True)

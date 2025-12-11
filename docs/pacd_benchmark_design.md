@@ -319,6 +319,53 @@ benchmark 与 diagnostics 只调用统一接口，不涉及内部实现。
 
 混杂子空间的图（PCA 投影）单独以 PNG 保存在 `subspace_plots/` 下。
 
+### 3.3 指标释义与解读指南（基准 + 诊断）
+
+为便于对齐代码实现与论文叙述，下面给出基准输出和诊断输出中各字段的“公式级”定义及建议解读方式。
+
+#### 3.3.1 基准指标（`simulation_benchmark_results.csv`）
+
+- `ate_hat`：方法输出的 ATE 估计。若方法内置交叉拟合，则为折外影响函数的均值；否则为全样本估计。
+- `tau_true`：仿真中的真 ATE（闭式或 Monte Carlo 计算）。
+- `abs_err = |ate_hat - tau_true|`：绝对偏差。越小越好。
+- `sq_err = (ate_hat - tau_true)^2`，`rmse = sqrt(mean(sq_err))`：平方误差与均方根误差；RMSE 聚合跨种子误差波动。
+- `runtime_sec`：方法一次运行的耗时（不含前置依赖安装）。
+- `r2_U`（可选）：若有真 U，则将方法 latent 与真 U 线性对齐后得到的平均 R²，反映表示是否捕捉到混杂子空间。
+
+#### 3.3.2 诊断指标（`simulation_diagnostics_results.csv`）
+
+**Proxy 信号（信息充足性）**
+
+- `proxy_r2_U`：cross-fitting 下，随机森林回归预测真 U 的 R²，衡量 proxy 对混杂的可重构度。
+- `proxy_r2_Y`：同上，对 Y 的 R²；高说明 proxy 可直接解释结局。
+- `proxy_auc_A`：随机森林分类预测 A 的 AUC；高说明 proxy 对处理决策有预测力。
+- `proxy_score = (proxy_r2_U + proxy_r2_Y + proxy_auc_A) / 3`：归一化综合分数，越高表示信息越充分。
+
+**残差相关（不可识别风险）**
+
+- 通过 cross-fitting 得到
+  - 处理残差：`r_A = A - e_hat(V)`，其中 `e_hat` 为代理变量 V→A 的预测；
+  - 结局残差：`r_Y = Y - m_hat(V)`，其中 `m_hat` 为 V→Y 的预测（可含 A）。
+- `resid_corr = Corr(r_A, r_Y)`；`resid_score = |resid_corr|`：残差仍相关说明存在未被 V 捕获的结构（可能是未观测混杂或模型欠拟合）。
+- `resid_r2_Y`、`resid_auc_A`：残差到 Y/A 的可预测度（越低越好），辅助判断是否纯噪声。
+
+**近端条件数（稳定性）**
+
+- 构造 M=[Z,W]（或退化为 X），做列标准化；奇异值为 `s_max ≥ … ≥ s_min`。
+- `prox_cond = s_max / s_min`，`prox_cond_score` 同名字段；`prox_s_min`、`prox_s_max` 便于排查数值稳定性。
+- 条件数过大（>1e3 量级）通常意味着病态识别，对近端类方法尤为不利。
+
+**子空间对齐（可解释性）**
+
+- `subspace_r2_ivapci` / `subspace_r2_pacdt`：将方法 latent 线性映射到真 U 的 R²，跨维度平均；仅在真 U 可见的仿真中计算。
+- 配套 `subspace_plots/` 的 PCA 图可视化真/估计混杂子空间的几何关系。
+
+#### 3.3.3 指标组合的诊断思路
+
+- `proxy_score` 低 + 误差高 → 典型“信息不足”情形；补充 proxy 或收集更多协变量可能是唯一解。
+- `proxy_score` 高但 `resid_score` 高 → “不可识别风险”，说明剩余结构被 proxy 未解释；需检查模型错配或潜在未观测混杂。
+- `prox_cond_score` 极大 → 近端方程病态，ATE 对噪声/估计误差高度敏感；可以尝试正则化或改用更稳健的表示/方法。
+
 ---
 
 ## 4. 诊断模块 pacd_diagnostics.py 的需求

@@ -99,27 +99,32 @@ python scripts/analyze_simulation_diagnostics.py --results outputs/diag_small/si
 
 **基准输出**（`simulation_benchmark_results.csv`）：
 
-- `scenario` / `seed` / `method`：运行配置。
-- `tau_true`：真实 ATE。
-- `ate_hat`：模型估计的 ATE。
-- `abs_err`、`sq_err`、`rmse`：绝对误差、平方误差、均方根误差。
-- `runtime_sec`：单次运行耗时。
-- `r2_U`（可选）：方法 latent 对真混杂的线性对齐 R²。
+- `tau_true`：仿真真值 ATE（闭式或 Monte Carlo）。
+- `ate_hat`：方法估计 ATE；如方法内部已交叉拟合，则为折外影响函数的均值。
+- `abs_err = |ate_hat - tau_true|`，`sq_err = (ate_hat - tau_true)^2`，`rmse = sqrt(mean(sq_err))`：误差幅度与稳定性，越小越好。
+- `runtime_sec`：单次运行耗时，便于比较效率。
+- `r2_U`（可选）：方法 latent 与真混杂 U 的线性对齐 R²，反映表示是否捕捉到混杂子空间。
 
 **诊断输出**（`simulation_diagnostics_results.csv`）：
 
-- Proxy 信号：`proxy_score`（综合得分）、`proxy_r2_U`、`proxy_r2_Y`、`proxy_auc_A`。
-- 残差风险：`resid_score = |Corr(r_A, r_Y)|`、`resid_corr`、`resid_r2_Y`、`resid_auc_A`。
-- 近端条件数：`prox_cond_score`（条件数）、`prox_cond`、`prox_s_min`、`prox_s_max`。
-- 子空间对齐（有真 U 时）：`subspace_r2_ivapci`、`subspace_r2_pacdt` 以及对应可视化 PNG 路径。
+- Proxy 信号：
+  - `proxy_r2_U`、`proxy_r2_Y`：cross-fitting 下随机森林对 U/Y 的 R²；
+  - `proxy_auc_A`：随机森林分类预测 A 的 AUC；
+  - `proxy_score = (proxy_r2_U + proxy_r2_Y + proxy_auc_A)/3`：综合信息充足度。
+- 残差风险：
+  - 处理残差 `r_A = A - e_hat(V)`，结局残差 `r_Y = Y - m_hat(V)`；
+  - `resid_corr = Corr(r_A, r_Y)`，`resid_score = |resid_corr|`，`resid_r2_Y`、`resid_auc_A` 反映残差是否仍可预测。
+- 近端条件数：
+  - 对 M=[Z,W]（或退化为 X）做 SVD，`prox_cond = s_max / s_min`，并记录 `prox_s_min`/`prox_s_max`；条件数高表示病态、结果不稳定。
+- 子空间对齐（有真 U 时）：`subspace_r2_ivapci`、`subspace_r2_pacdt` 以及对应 PCA PNG 路径，用于解释表示几何。
 
 **读图指南**：
 
-- MAE/RMSE 柱状图：越低越好，用于比较各方法精度。
+- MAE/RMSE 柱状图：越低越好，用于快速对比方法精度与方差。
 - 诊断散点：
-  - `proxy_score` 低且误差高 → proxy 信息不足。
-  - `resid_score` 高且 proxy_score 高 → 不可识别风险（残差仍相关）。
-  - `prox_cond_score` 极高 → 近端方程病态，估计不稳定。
+  - `proxy_score` 低且误差高 → proxy 信息不足；
+  - `proxy_score` 高但 `resid_score` 高 → 残留未解释结构或不可识别风险；
+  - `prox_cond_score` 极高（>1e3）→ 近端方程病态，需正则化或换模型。
 
 ## 5. 常见问题
 
