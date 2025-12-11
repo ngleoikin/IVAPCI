@@ -26,7 +26,7 @@ from models.baselines import DRGLMEstimator, DRRFEstimator, NaiveEstimator, Orac
 from models.ivapci_gold import IVAPCIGoldEstimator
 from models.ivapci_v21 import IVAPCIv21Estimator, IVAPCIv21GLMEstimator, IVAPCIv21RADREstimator
 from models.ivapci_v2_1_pacd_glm import IVAPCIPACDTGLMEstimator
-from models.ivapci_v31_pacd_encoder import IVAPCIv31PACDEncoderEstimator
+from models.ivapci_v31_pacd_encoder import IVAPCIv31PACDEncoderEstimator, IVAPCIv31RADREstimator
 from models.pacdt_v30 import PACDTv30Estimator
 from simulators.simulators import list_scenarios, simulate_scenario
 
@@ -50,6 +50,8 @@ def _build_estimator(name: str):
         return IVAPCIPACDTGLMEstimator()
     if name == "ivapci_v3_1_pacd":
         return IVAPCIv31PACDEncoderEstimator()
+    if name == "ivapci_v3_1_radr":
+        return IVAPCIv31RADREstimator()
     if name == "ivapci_gold":
         return IVAPCIGoldEstimator()
     if name == "pacdt_v3_0":
@@ -110,11 +112,12 @@ def run_benchmark(
                 runtime = time.time() - t0
                 r2_u = np.nan
                 if hasattr(est, "get_latent") and method in {
-                    "ivapci_v2_1",
+                    "ivapci_v2_1", 
                     "ivapci_v2_1_glm",
                     "ivapci_v2_1_radr",
                     "ivapci_v2_1_pacd_glm",
                     "ivapci_v3_1_pacd",
+                    "ivapci_v3_1_radr",
                     "ivapci_gold",
                     "pacdt_v3_0",
                 }:
@@ -188,6 +191,7 @@ def parse_args() -> argparse.Namespace:
             "ivapci_v2_1_radr",
             "ivapci_v2_1_pacd_glm",
             "ivapci_v3_1_pacd",
+            "ivapci_v3_1_radr",
             "ivapci_gold",
             "pacdt_v3_0",
         ],

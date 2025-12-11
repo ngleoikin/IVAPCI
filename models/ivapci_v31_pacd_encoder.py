@@ -7,6 +7,7 @@ from typing import Iterable, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.model_selection import KFold, train_test_split
 
@@ -448,4 +449,93 @@ class IVAPCIv31PACDEncoderEstimator(BaseCausalEstimator):
         return float(np.mean(psi))
 
 
-__all__ = ["IVAPCIV31Config", "IVAPCIv31PACDEncoderEstimator"]
+class IVAPCIv31RADREstimator(IVAPCIv31PACDEncoderEstimator):
+    """IVAPCI v3.1 with RADR-style head calibration on the causal latent U_c.
+
+    Stage 1: learn causal/noise split encoder with adversary and p-adic regularizer
+    (identical to :class:`IVAPCIv31PACDEncoderEstimator`).
+
+    Stage 2: freeze encoder, extract U_c and head predictions, then run a
+    cross-fitted RADR calibration:
+
+    * Propensity: logistic regression on [s(U_c), U_c] where s is the A-head logit.
+    * Outcome: linear regression on [A, U_c, t(A,U_c), A*t(A,U_c)] where t is the
+      Y-head prediction (destandardized).
+
+    The calibrated nuisances are plugged into the standard DR/AIPW score.
+    """
+
+    def _head_features(self, U: np.ndarray, A: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        U_t = torch.from_numpy(U.astype(np.float32)).to(self.device)
+        A_t = torch.from_numpy(A.astype(np.float32)).to(self.device)
+        self.a_head.eval(); self.y_head.eval()
+        with torch.no_grad():
+            s_logits = self.a_head(U_t).cpu().numpy()
+            t_obs_std = self.y_head(U_t, A_t).cpu().numpy()
+            ones = torch.ones_like(A_t)
+            zeros = torch.zeros_like(A_t)
+            t1_std = self.y_head(U_t, ones).cpu().numpy()
+            t0_std = self.y_head(U_t, zeros).cpu().numpy()
+
+        y_std = float(self._y_std.squeeze()) if hasattr(self, "_y_std") else 1.0
+        y_mean = float(self._y_mean.squeeze()) if hasattr(self, "_y_mean") else 0.0
+
+        def _destandardize(arr: np.ndarray) -> np.ndarray:
+            return arr * y_std + y_mean
+
+        return s_logits, _destandardize(t_obs_std), _destandardize(t1_std), _destandardize(t0_std)
+
+    def _dr_ate(self, U: np.ndarray, A: np.ndarray, Y: np.ndarray) -> float:
+        cfg = self.config
+        U = np.asarray(U)
+        A = np.asarray(A).reshape(-1)
+        Y = np.asarray(Y).reshape(-1)
+
+        s_logits, t_obs, t1_all, t0_all = self._head_features(U, A)
+
+        kf = KFold(n_splits=cfg.n_splits_dr, shuffle=True, random_state=cfg.seed)
+        psi = np.zeros_like(Y, dtype=float)
+
+        for train_idx, test_idx in kf.split(U):
+            U_train, U_test = U[train_idx], U[test_idx]
+            A_train, A_test = A[train_idx], A[test_idx]
+            Y_train, Y_test = Y[train_idx], Y[test_idx]
+            s_train, s_test = s_logits[train_idx], s_logits[test_idx]
+            t_train, t_test = t_obs[train_idx], t_obs[test_idx]
+            t1_test, t0_test = t1_all[test_idx], t0_all[test_idx]
+
+            # Propensity calibration
+            if np.unique(A_train).size < 2:
+                e_hat = np.full_like(A_test, fill_value=float(np.mean(A_train)) if len(A_train) else 0.5, dtype=float)
+            else:
+                prop = LogisticRegression(max_iter=2000, solver="lbfgs")
+                X_prop_train = np.column_stack([s_train, U_train])
+                X_prop_test = np.column_stack([s_test, U_test])
+                prop.fit(X_prop_train, A_train)
+                e_hat = prop.predict_proba(X_prop_test)[:, 1]
+            e_hat = np.clip(e_hat, 1e-3, 1 - 1e-3)
+
+            # Outcome calibration
+            X_out_train = np.column_stack([A_train, U_train, t_train, A_train * t_train])
+            if len(A_train) == 0:
+                out_model: LinearRegression | DummyRegressor = DummyRegressor(
+                    strategy="constant", constant=float(np.mean(Y_train)) if len(Y_train) else 0.0
+                ).fit(np.zeros((1, X_out_train.shape[1])), [0.0])
+            else:
+                out_model = LinearRegression()
+                out_model.fit(X_out_train, Y_train)
+
+            X_out_test = np.column_stack([A_test, U_test, t_test, A_test * t_test])
+            m_hat = out_model.predict(X_out_test)
+
+            X1 = np.column_stack([np.ones_like(A_test), U_test, t1_test, t1_test])
+            X0 = np.column_stack([np.zeros_like(A_test), U_test, t0_test, np.zeros_like(t0_test)])
+            m1_hat = out_model.predict(X1)
+            m0_hat = out_model.predict(X0)
+
+            psi[test_idx] = m1_hat - m0_hat + (A_test - e_hat) / (e_hat * (1 - e_hat)) * (Y_test - m_hat)
+
+        return float(np.mean(psi))
+
+
+__all__ = ["IVAPCIV31Config", "IVAPCIv31PACDEncoderEstimator", "IVAPCIv31RADREstimator"]
