@@ -37,7 +37,7 @@ from models.pacdt_v30 import PACDTv30Estimator
 from simulators.simulators import list_scenarios, simulate_scenario
 
 
-def _build_estimator(name: str):
+def _build_estimator(name: str, x_dim: int | None = None, w_dim: int | None = None, z_dim: int | None = None):
     if name == "naive":
         return NaiveEstimator()
     if name == "dr_glm":
@@ -61,10 +61,14 @@ def _build_estimator(name: str):
     if name == "ivapci_v3_1_radr_theory":
         return IVAPCIv31TheoryRADREstimator()
     if name == "ivapci_v3_2_hier":
+        if x_dim is None or w_dim is None or z_dim is None:
+            raise ValueError("ivapci_v3_2_hier requires x_dim, w_dim, and z_dim")
         return IVAPCIv32HierEncoderEstimator(
             IVAPCIV32HierConfig(x_dim=x_dim, w_dim=w_dim, z_dim=z_dim)
         )
     if name == "ivapci_v3_2_hier_radr":
+        if x_dim is None or w_dim is None or z_dim is None:
+            raise ValueError("ivapci_v3_2_hier_radr requires x_dim, w_dim, and z_dim")
         return IVAPCIv32HierRADREstimator(
             IVAPCIV32HierConfig(x_dim=x_dim, w_dim=w_dim, z_dim=z_dim)
         )
@@ -171,8 +175,11 @@ def run_benchmark(
             A = data["A"]
             Y = data["Y"]
             tau_true = data["tau"]
+            x_dim = data.get("X").shape[1] if data.get("X") is not None else 0
+            w_dim = data.get("W").shape[1] if data.get("W") is not None else 0
+            z_dim = data.get("Z").shape[1] if data.get("Z") is not None else 0
             for method in methods:
-                est = _build_estimator(method)
+                est = _build_estimator(method, x_dim=x_dim, w_dim=w_dim, z_dim=z_dim)
                 X_input = data["U"] if method == "oracle_U" else X_all
                 t0 = time.time()
                 est.fit(X_input, A, Y)
