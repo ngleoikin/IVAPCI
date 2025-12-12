@@ -42,7 +42,14 @@ from models.pacdt_v30 import PACDTv30Estimator
 from simulators.simulators import list_scenarios, simulate_scenario
 
 
-def _build_estimator(name: str, x_dim: int | None = None, w_dim: int | None = None, z_dim: int | None = None):
+def _build_estimator(
+    name: str,
+    x_dim: int | None = None,
+    w_dim: int | None = None,
+    z_dim: int | None = None,
+    n_samples: int | None = None,
+    seed: int | None = None,
+):
     if name == "naive":
         return NaiveEstimator()
     if name == "dr_glm":
@@ -68,15 +75,17 @@ def _build_estimator(name: str, x_dim: int | None = None, w_dim: int | None = No
     if name == "ivapci_v3_2_hier":
         if x_dim is None or w_dim is None or z_dim is None:
             raise ValueError("ivapci_v3_2_hier requires x_dim, w_dim, and z_dim")
-        return IVAPCIv32HierEncoderEstimator(
-            IVAPCIV32HierConfig(x_dim=x_dim, w_dim=w_dim, z_dim=z_dim)
-        )
+        cfg = IVAPCIV32HierConfig(x_dim=x_dim, w_dim=w_dim, z_dim=z_dim)
+        if seed is not None:
+            cfg.seed = seed
+        return IVAPCIv32HierEncoderEstimator(cfg)
     if name == "ivapci_v3_2_hier_radr":
         if x_dim is None or w_dim is None or z_dim is None:
             raise ValueError("ivapci_v3_2_hier_radr requires x_dim, w_dim, and z_dim")
-        return IVAPCIv32HierRADREstimator(
-            IVAPCIV32HierConfig(x_dim=x_dim, w_dim=w_dim, z_dim=z_dim)
-        )
+        cfg = IVAPCIV32HierConfig(x_dim=x_dim, w_dim=w_dim, z_dim=z_dim)
+        if seed is not None:
+            cfg.seed = seed
+        return IVAPCIv32HierRADREstimator(cfg)
     if name == "ivapci_v3_3_hier":
         if x_dim is None or w_dim is None or z_dim is None:
             raise ValueError("ivapci_v3_3_hier requires x_dim, w_dim, and z_dim")
@@ -84,8 +93,10 @@ def _build_estimator(name: str, x_dim: int | None = None, w_dim: int | None = No
             x_dim=x_dim,
             w_dim=w_dim,
             z_dim=z_dim,
-            n_samples_hint=None,
+            n_samples_hint=n_samples,
         )
+        if seed is not None:
+            cfg.seed = seed
         return IVAPCIv33TheoryHierEstimator(cfg)
     if name == "ivapci_v3_3_hier_radr":
         if x_dim is None or w_dim is None or z_dim is None:
@@ -94,8 +105,10 @@ def _build_estimator(name: str, x_dim: int | None = None, w_dim: int | None = No
             x_dim=x_dim,
             w_dim=w_dim,
             z_dim=z_dim,
-            n_samples_hint=None,
+            n_samples_hint=n_samples,
         )
+        if seed is not None:
+            cfg.seed = seed
         return IVAPCIv33TheoryHierRADREstimator(cfg)
     if name == "ivapci_gold":
         return IVAPCIGoldEstimator()
@@ -204,7 +217,9 @@ def run_benchmark(
             w_dim = data.get("W").shape[1] if data.get("W") is not None else 0
             z_dim = data.get("Z").shape[1] if data.get("Z") is not None else 0
             for method in methods:
-                est = _build_estimator(method, x_dim=x_dim, w_dim=w_dim, z_dim=z_dim)
+                est = _build_estimator(
+                    method, x_dim=x_dim, w_dim=w_dim, z_dim=z_dim, n_samples=n_samples, seed=seed
+                )
                 if hasattr(est, "config") and hasattr(est.config, "n_samples_hint"):
                     if est.config.n_samples_hint is None:
                         est.config.n_samples_hint = n_samples

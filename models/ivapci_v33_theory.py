@@ -205,7 +205,7 @@ class IVAPCIV33TheoryConfig:
     lambda_a: float = 0.1
     lambda_y: float = 0.5
     lambda_ortho: float = 0.01
-    lambda_cond_ortho: float = 0.0
+    lambda_cond_ortho: float = 1e-3
     lambda_consistency: float = 0.05
     gamma_adv_w: float = 0.1
     gamma_adv_z: float = 0.1
@@ -228,6 +228,8 @@ class IVAPCIV33TheoryConfig:
 
     seed: int = 42
     device: str = "cpu"
+
+    cond_ortho_warmup_epochs: int = 10
 
     n_samples_hint: Optional[int] = None
     adaptive: bool = True
@@ -389,7 +391,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         best_state = None
 
         # Stage 1: full training
-        for _ in range(cfg.epochs_main):
+        for epoch in range(cfg.epochs_main):
             self.enc_x.train(); self.enc_w.train(); self.enc_z.train(); self.enc_n.train()
             self.decoder.train(); self.a_head.train(); self.y_head.train()
             self.a_from_z.train(); self.y_from_w.train()
@@ -415,8 +417,13 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 consistency = cons_a + cons_y
 
                 ortho = _offdiag_corr_penalty([tx, tw, tz, tn])
+                warmup = cfg.cond_ortho_warmup_epochs
+                cond_weight = 0.0
+                if cfg.lambda_cond_ortho > 0 and epoch >= warmup:
+                    ramp = min(1.0, (epoch - warmup + 1) / max(1, warmup))
+                    cond_weight = float(cfg.lambda_cond_ortho * ramp)
                 cond_ortho = torch.zeros((), device=self.device)
-                if cfg.lambda_cond_ortho > 0:
+                if cond_weight > 0:
                     cond_ortho = _conditional_orthogonal_penalty([tw, tz, tn], torch.cat([tx, tz], dim=1))
 
                 adv_w_logits = self.adv_w(tw)
@@ -429,7 +436,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     + cfg.lambda_y * mse(y_pred, yb)
                     + cfg.lambda_consistency * consistency
                     + cfg.lambda_ortho * ortho
-                    + cfg.lambda_cond_ortho * cond_ortho
+                    + cond_weight * cond_ortho
                     + cfg.gamma_padic * _padic_ultrametric_loss(torch.cat([tx, tz], dim=1))
                     - cfg.gamma_adv_w * bce(adv_w_logits, ab)
                     - cfg.gamma_adv_n * bce(adv_n_logits, ab)
