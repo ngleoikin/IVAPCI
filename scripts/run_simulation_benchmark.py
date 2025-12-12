@@ -33,6 +33,11 @@ from models.ivapci_v32_hierarchical import (
     IVAPCIv32HierEncoderEstimator,
     IVAPCIv32HierRADREstimator,
 )
+from models.ivapci_v33_theory import (
+    IVAPCIV33TheoryConfig,
+    IVAPCIv33TheoryHierEstimator,
+    IVAPCIv33TheoryHierRADREstimator,
+)
 from models.pacdt_v30 import PACDTv30Estimator
 from simulators.simulators import list_scenarios, simulate_scenario
 
@@ -72,6 +77,26 @@ def _build_estimator(name: str, x_dim: int | None = None, w_dim: int | None = No
         return IVAPCIv32HierRADREstimator(
             IVAPCIV32HierConfig(x_dim=x_dim, w_dim=w_dim, z_dim=z_dim)
         )
+    if name == "ivapci_v3_3_hier":
+        if x_dim is None or w_dim is None or z_dim is None:
+            raise ValueError("ivapci_v3_3_hier requires x_dim, w_dim, and z_dim")
+        cfg = IVAPCIV33TheoryConfig(
+            x_dim=x_dim,
+            w_dim=w_dim,
+            z_dim=z_dim,
+            n_samples_hint=None,
+        )
+        return IVAPCIv33TheoryHierEstimator(cfg)
+    if name == "ivapci_v3_3_hier_radr":
+        if x_dim is None or w_dim is None or z_dim is None:
+            raise ValueError("ivapci_v3_3_hier_radr requires x_dim, w_dim, and z_dim")
+        cfg = IVAPCIV33TheoryConfig(
+            x_dim=x_dim,
+            w_dim=w_dim,
+            z_dim=z_dim,
+            n_samples_hint=None,
+        )
+        return IVAPCIv33TheoryHierRADREstimator(cfg)
     if name == "ivapci_gold":
         return IVAPCIGoldEstimator()
     if name == "pacdt_v3_0":
@@ -180,6 +205,11 @@ def run_benchmark(
             z_dim = data.get("Z").shape[1] if data.get("Z") is not None else 0
             for method in methods:
                 est = _build_estimator(method, x_dim=x_dim, w_dim=w_dim, z_dim=z_dim)
+                if hasattr(est, "config") and hasattr(est.config, "n_samples_hint"):
+                    if est.config.n_samples_hint is None:
+                        est.config.n_samples_hint = n_samples
+                        if getattr(est.config, "adaptive", False):
+                            est.config.apply_theorem45_defaults()
                 X_input = data["U"] if method == "oracle_U" else X_all
                 t0 = time.time()
                 est.fit(X_input, A, Y)
@@ -196,6 +226,8 @@ def run_benchmark(
                     "ivapci_v3_1_radr_theory",
                     "ivapci_v3_2_hier",
                     "ivapci_v3_2_hier_radr",
+                    "ivapci_v3_3_hier",
+                    "ivapci_v3_3_hier_radr",
                     "ivapci_gold",
                     "pacdt_v3_0",
                 }:
@@ -203,6 +235,14 @@ def run_benchmark(
                     r2_u = _latent_r2(data["U"], latent)
                 abs_err = abs(ate_hat - tau_true)
                 sq_err = (ate_hat - tau_true) ** 2
+                train_diag = (
+                    est.get_training_diagnostics() if hasattr(est, "get_training_diagnostics") else {}
+                )
+                protected = train_diag.get("protected_features", np.nan)
+                info_loss = train_diag.get("info_loss_proxy", np.nan)
+                adv_w_acc = train_diag.get("adv_w_acc", np.nan)
+                adv_n_acc = train_diag.get("adv_n_acc", np.nan)
+                adv_z_r2 = train_diag.get("adv_z_r2", np.nan)
                 records.append(
                     {
                         "scenario": scenario,
@@ -214,6 +254,11 @@ def run_benchmark(
                         "sq_err": sq_err,
                         "runtime_sec": runtime,
                         "r2_U": r2_u,
+                        "protected_features": protected,
+                        "info_loss_proxy": info_loss,
+                        "adv_w_acc": adv_w_acc,
+                        "adv_n_acc": adv_n_acc,
+                        "adv_z_r2": adv_z_r2,
                     }
                 )
 
@@ -273,6 +318,8 @@ def parse_args() -> argparse.Namespace:
             "ivapci_v3_1_radr_theory",
             "ivapci_v3_2_hier",
             "ivapci_v3_2_hier_radr",
+            "ivapci_v3_3_hier",
+            "ivapci_v3_3_hier_radr",
             "ivapci_gold",
             "pacdt_v3_0",
         ],
