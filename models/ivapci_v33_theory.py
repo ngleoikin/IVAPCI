@@ -24,7 +24,8 @@ from . import BaseCausalEstimator
 def _info_aware_standardize(
     train: np.ndarray,
     min_std: float = 1e-2,
-    low_var_min_std: float = 1e-4,
+    low_var_min_std: float = 1e-3,
+    clip_value: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Standardize while *clamping* (not flattening) near-constant dimensions.
 
@@ -47,7 +48,10 @@ def _info_aware_standardize(
         np.maximum(std, low_var_min_std),
         std,
     )
-    return (train - mean) / std_clamped, mean, std_clamped, protected
+    standardized = (train - mean) / std_clamped
+    if clip_value is not None:
+        standardized = np.clip(standardized, -clip_value, clip_value)
+    return standardized, mean, std_clamped, protected
 
 
 def _apply_standardize(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
@@ -163,12 +167,11 @@ def _conditional_orthogonal_penalty(blocks: list[torch.Tensor], cond: torch.Tens
     C = _center(cond)
     CtC = C.T @ C / C.shape[0]
     I = torch.eye(CtC.shape[0], device=C.device)
-    inv = torch.linalg.inv(CtC + ridge * I)
     Ct = C.T / C.shape[0]
     resid = []
     for B in blocks:
         Bc = _center(B)
-        Beta = inv @ (Ct @ Bc)
+        Beta = torch.linalg.solve(CtC + ridge * I, Ct @ Bc)
         resid.append(Bc - C @ Beta)
     return _offdiag_corr_penalty(resid)
 
@@ -231,7 +234,8 @@ class IVAPCIV33TheoryConfig:
     gamma_padic: float = 1e-3
 
     min_std: float = 1e-2
-    low_var_min_std: float = 1e-4
+    low_var_min_std: float = 1e-3
+    std_clip: Optional[float] = 10.0
     use_noise_in_latent: bool = True
 
     lr_main: float = 1e-3
@@ -244,7 +248,7 @@ class IVAPCIV33TheoryConfig:
     early_stopping_min_delta: float = 0.0
 
     n_splits_dr: int = 2
-    clip_prop: float = 1e-3
+    clip_prop: float = 5e-3
 
     seed: int = 42
     device: str = "cpu"
@@ -300,13 +304,34 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         self._protected_mask: Optional[np.ndarray] = None
         self.training_diagnostics: Dict[str, float] = {}
         self.info_monitor = InformationLossMonitor()
+        self._block_slices: Optional[Tuple[slice, slice, slice]] = None
+
+    @staticmethod
+    def _toggle_requires_grad(modules: Iterable[nn.Module], flag: bool) -> None:
+        for mod in modules:
+            for p in mod.parameters():
+                p.requires_grad = flag
 
     # --- model wiring ---
     def _build(self, d_all: int) -> None:
         cfg = self.config
-        self.enc_x = _GroupEncoder(d_all, cfg.enc_x_hidden, cfg.latent_x_dim).to(self.device)
-        self.enc_w = _GroupEncoder(d_all, cfg.enc_w_hidden, cfg.latent_w_dim).to(self.device)
-        self.enc_z = _GroupEncoder(d_all, cfg.enc_z_hidden, cfg.latent_z_dim, dropout=cfg.dropout_z).to(self.device)
+        self._block_slices = None
+        if cfg.x_dim and cfg.w_dim and cfg.z_dim:
+            if cfg.x_dim + cfg.w_dim + cfg.z_dim != d_all:
+                raise ValueError("x_dim + w_dim + z_dim must equal input dimension")
+            self._block_slices = (
+                slice(0, cfg.x_dim),
+                slice(cfg.x_dim, cfg.x_dim + cfg.w_dim),
+                slice(cfg.x_dim + cfg.w_dim, cfg.x_dim + cfg.w_dim + cfg.z_dim),
+            )
+
+        x_in = cfg.x_dim if self._block_slices else d_all
+        w_in = cfg.w_dim if self._block_slices else d_all
+        z_in = cfg.z_dim if self._block_slices else d_all
+
+        self.enc_x = _GroupEncoder(x_in, cfg.enc_x_hidden, cfg.latent_x_dim).to(self.device)
+        self.enc_w = _GroupEncoder(w_in, cfg.enc_w_hidden, cfg.latent_w_dim).to(self.device)
+        self.enc_z = _GroupEncoder(z_in, cfg.enc_z_hidden, cfg.latent_z_dim, dropout=cfg.dropout_z).to(self.device)
         self.enc_n = _GroupEncoder(d_all, cfg.enc_n_hidden, cfg.latent_n_dim).to(self.device)
 
         total_lat = cfg.latent_x_dim + cfg.latent_w_dim + cfg.latent_z_dim + cfg.latent_n_dim
@@ -339,10 +364,24 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         adv_params = list(self.adv_w.parameters()) + list(self.adv_z.parameters()) + list(self.adv_n.parameters())
         self.adv_opt = torch.optim.Adam(adv_params, lr=cfg.lr_adv)
 
-    def _encode_blocks(self, V_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        tx = self.enc_x(V_t)
-        tw = self.enc_w(V_t)
-        tz = self.enc_z(V_t)
+    def _split_blocks_tensor(
+        self, V_t: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._block_slices is None:
+            return V_t, V_t, V_t
+        return (
+            V_t[:, self._block_slices[0]],
+            V_t[:, self._block_slices[1]],
+            V_t[:, self._block_slices[2]],
+        )
+
+    def _encode_blocks(
+        self, V_t: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        x_part, w_part, z_part = self._split_blocks_tensor(V_t)
+        tx = self.enc_x(x_part)
+        tw = self.enc_w(w_part)
+        tz = self.enc_z(z_part)
         tn = self.enc_n(V_t)
         return tx, tw, tz, tn
 
@@ -370,13 +409,19 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         Y_tr, Y_va = Y[tr_idx], Y[va_idx]
 
         V_tr_std, self._v_mean, self._v_std, protected = _info_aware_standardize(
-            V_tr, min_std=cfg.min_std, low_var_min_std=cfg.low_var_min_std
+            V_tr,
+            min_std=cfg.min_std,
+            low_var_min_std=cfg.low_var_min_std,
+            clip_value=cfg.std_clip,
         )
         self._protected_mask = protected
         V_va_std = _apply_standardize(V_va, self._v_mean, self._v_std)
+        if cfg.std_clip is not None:
+            V_tr_std = np.clip(V_tr_std, -cfg.std_clip, cfg.std_clip)
+            V_va_std = np.clip(V_va_std, -cfg.std_clip, cfg.std_clip)
 
         Y_tr_std, self._y_mean, self._y_std, _ = _info_aware_standardize(
-            Y_tr.reshape(-1, 1), min_std=1e-6, low_var_min_std=1e-6
+            Y_tr.reshape(-1, 1), min_std=1e-6, low_var_min_std=1e-6, clip_value=cfg.std_clip
         )
         Y_tr_std = Y_tr_std.squeeze(1)
         Y_va_std = _apply_standardize(Y_va.reshape(-1, 1), self._y_mean, self._y_std).squeeze(1)
@@ -432,6 +477,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 self.adv_opt.zero_grad(); adv_loss.backward(); self.adv_opt.step()
 
                 # main update
+                self._toggle_requires_grad([self.adv_w, self.adv_n, self.adv_z], False)
                 tx, tw, tz, tn = self._encode_blocks(vb)
                 recon = self.decoder(torch.cat([tx, tw, tz, tn], dim=1))
                 logits_a = self.a_head(torch.cat([tx, tz], dim=1))
@@ -469,6 +515,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 )
 
                 self.main_opt.zero_grad(); loss_main.backward(); self.main_opt.step()
+                self._toggle_requires_grad([self.adv_w, self.adv_n, self.adv_z], True)
 
             # validation
             self.enc_x.eval(); self.enc_w.eval(); self.enc_z.eval(); self.enc_n.eval()
@@ -522,7 +569,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
 
         # Diagnostics
         self.training_diagnostics = self.info_monitor.estimate(self, V_all)
-        self.training_diagnostics["protected_features"] = int(np.sum(self._protected_mask)) if self._protected_mask is not None else 0
+        self.training_diagnostics["protected_features"] = (
+            int(np.sum(self._protected_mask)) if self._protected_mask is not None else 0
+        )
         self.training_diagnostics["min_std"] = float(cfg.min_std)
 
         # Adversary diagnostics (aligned with training standardization)
