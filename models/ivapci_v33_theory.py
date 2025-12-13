@@ -20,9 +20,16 @@ from . import BaseCausalEstimator
 # -------------------------
 
 def _info_aware_standardize(
-    train: np.ndarray, min_std: float = 1e-2
+    train: np.ndarray,
+    min_std: float = 1e-2,
+    low_var_min_std: float = 1e-4,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Standardize with clamping of near-constant dimensions.
+    """Standardize while *clamping* (not flattening) near-constant dimensions.
+
+    Near-deterministic proxy channels keep their small variance (plus a tiny
+    floor) instead of being inflated to the global ``min_std``. This protects
+    low-variance informative proxies in "low-var" scenarios from being washed
+    out by preprocessing.
 
     Returns:
         train_std, mean, std_clamped, protected_mask
@@ -30,8 +37,15 @@ def _info_aware_standardize(
     mean = train.mean(axis=0, keepdims=True)
     std = train.std(axis=0, keepdims=True)
     protected = (std < min_std).squeeze(0)
-    std = np.maximum(std, min_std)
-    return (train - mean) / std, mean, std, protected
+
+    # Use a softer floor for extremely low-variance channels so their signal is
+    # preserved (Theorem-1 guidance for low-var proxies).
+    std_clamped = np.where(
+        std < min_std,
+        np.maximum(std, low_var_min_std),
+        std,
+    )
+    return (train - mean) / std_clamped, mean, std_clamped, protected
 
 
 def _apply_standardize(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
@@ -213,6 +227,8 @@ class IVAPCIV33TheoryConfig:
     gamma_padic: float = 1e-3
 
     min_std: float = 1e-2
+    low_var_min_std: float = 1e-4
+    use_noise_in_latent: bool = True
 
     lr_main: float = 1e-3
     lr_adv: float = 1e-3
@@ -255,6 +271,7 @@ class IVAPCIV33TheoryConfig:
 
         self.gamma_padic = 0.001 * np.sqrt(np.log1p(n))
         self.min_std = max(1e-4, 1e-2 / np.sqrt(np.log1p(n)))
+        self.low_var_min_std = min(self.low_var_min_std, self.min_std * 0.1)
 
         self.epochs_pretrain = int(min(80, 30 + 10 * np.log1p(n / 500)))
         self.epochs_main = int(min(250, 80 + 20 * np.log1p(n / 500)))
@@ -348,11 +365,15 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         A_tr, A_va = A[tr_idx], A[va_idx]
         Y_tr, Y_va = Y[tr_idx], Y[va_idx]
 
-        V_tr_std, self._v_mean, self._v_std, protected = _info_aware_standardize(V_tr, min_std=cfg.min_std)
+        V_tr_std, self._v_mean, self._v_std, protected = _info_aware_standardize(
+            V_tr, min_std=cfg.min_std, low_var_min_std=cfg.low_var_min_std
+        )
         self._protected_mask = protected
         V_va_std = _apply_standardize(V_va, self._v_mean, self._v_std)
 
-        Y_tr_std, self._y_mean, self._y_std, _ = _info_aware_standardize(Y_tr.reshape(-1, 1), min_std=1e-6)
+        Y_tr_std, self._y_mean, self._y_std, _ = _info_aware_standardize(
+            Y_tr.reshape(-1, 1), min_std=1e-6, low_var_min_std=1e-6
+        )
         Y_tr_std = Y_tr_std.squeeze(1)
         Y_va_std = _apply_standardize(Y_va.reshape(-1, 1), self._y_mean, self._y_std).squeeze(1)
 
@@ -527,9 +548,11 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         V_all = np.asarray(V_all, dtype=np.float32)
         V_std = _apply_standardize(V_all, self._v_mean, self._v_std)
         V_t = torch.from_numpy(V_std).to(self.device)
-        self.enc_x.eval(); self.enc_w.eval(); self.enc_z.eval()
+        self.enc_x.eval(); self.enc_w.eval(); self.enc_z.eval(); self.enc_n.eval()
         with torch.no_grad():
-            tx, tw, tz, _ = self._encode_blocks(V_t)
+            tx, tw, tz, tn = self._encode_blocks(V_t)
+        if self.config.use_noise_in_latent:
+            return torch.cat([tx, tw, tz, tn], dim=1).cpu().numpy()
         return torch.cat([tx, tw, tz], dim=1).cpu().numpy()
 
     def _dr_ate(self, U: np.ndarray, A: np.ndarray, Y: np.ndarray) -> float:
@@ -551,10 +574,25 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 e_hat = prop.predict_proba(U_te)[:, 1]
             e_hat = np.clip(e_hat, cfg.clip_prop, 1 - cfg.clip_prop)
 
-            reg = LinearRegression().fit(np.column_stack([A_tr, U_tr]), Y_tr)
-            m_hat = reg.predict(np.column_stack([A_te, U_te]))
-            m1 = reg.predict(np.column_stack([np.ones_like(A_te), U_te]))
-            m0 = reg.predict(np.column_stack([np.zeros_like(A_te), U_te]))
+            # Arm-specific outcome models to accommodate heterogeneous effects
+            if np.any(A_tr == 1):
+                m1_model: LinearRegression | DummyRegressor = LinearRegression()
+                m1_model.fit(U_tr[A_tr == 1], Y_tr[A_tr == 1])
+            else:
+                m1_model = DummyRegressor(strategy="constant", constant=float(np.mean(Y_tr)))
+                m1_model.fit(np.zeros((1, U_tr.shape[1])), [0.0])
+
+            if np.any(A_tr == 0):
+                m0_model: LinearRegression | DummyRegressor = LinearRegression()
+                m0_model.fit(U_tr[A_tr == 0], Y_tr[A_tr == 0])
+            else:
+                m0_model = DummyRegressor(strategy="constant", constant=float(np.mean(Y_tr)))
+                m0_model.fit(np.zeros((1, U_tr.shape[1])), [0.0])
+
+            m1 = m1_model.predict(U_te)
+            m0 = m0_model.predict(U_te)
+            m_hat = np.where(A_te == 1, m1, m0)
+
             psi[te] = m1 - m0 + (A_te - e_hat) / (e_hat * (1 - e_hat)) * (Y_te - m_hat)
         return float(np.mean(psi))
 
