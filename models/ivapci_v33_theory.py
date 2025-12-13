@@ -9,8 +9,10 @@ import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.dummy import DummyRegressor
-from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
+from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold, train_test_split
+from sklearn.preprocessing import StandardScaler
 
 from . import BaseCausalEstimator
 
@@ -221,6 +223,8 @@ class IVAPCIV33TheoryConfig:
     lambda_ortho: float = 0.01
     lambda_cond_ortho: float = 1e-3
     lambda_consistency: float = 0.05
+    ridge_alpha: float = 1e-2
+    standardize_nuisance: bool = True
     gamma_adv_w: float = 0.1
     gamma_adv_z: float = 0.1
     gamma_adv_n: float = 0.1
@@ -520,29 +524,33 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         self.training_diagnostics = self.info_monitor.estimate(self, V_all)
         self.training_diagnostics["protected_features"] = int(np.sum(self._protected_mask)) if self._protected_mask is not None else 0
         self.training_diagnostics["min_std"] = float(cfg.min_std)
-        # Adversary accuracies / R2
-        V_std_full = _apply_standardize(V_all, self._v_mean, self._v_std)
-        with torch.no_grad():
-            tx, tw, tz, tn = self._encode_blocks(torch.from_numpy(V_std_full).to(self.device))
-            adv_w_logits = self.adv_w(tw).cpu().numpy()
-            adv_n_logits = self.adv_n(tn).cpu().numpy()
-            adv_z_pred = self.adv_z(tz).cpu().numpy()
-        A_sig = (1 / (1 + np.exp(-adv_w_logits)))
-        A_pred_w = (A_sig >= 0.5).astype(float)
-        A_sig_n = (1 / (1 + np.exp(-adv_n_logits)))
-        A_pred_n = (A_sig_n >= 0.5).astype(float)
-        self.training_diagnostics["adv_w_acc"] = float(np.mean(A_pred_w == A)) if len(A) else np.nan
-        self.training_diagnostics["adv_n_acc"] = float(np.mean(A_pred_n == A)) if len(A) else np.nan
-        if np.var(Y) > 0:
-            scale = float(self._y_std.squeeze()) if hasattr(self, "_y_std") else 1.0
-            mean = float(self._y_mean.squeeze()) if hasattr(self, "_y_mean") else 0.0
-            y_hat_z = adv_z_pred * scale + mean
-            ss_res = float(np.sum((Y - y_hat_z) ** 2))
-            ss_tot = float(np.sum((Y - np.mean(Y)) ** 2))
-            self.training_diagnostics["adv_z_r2"] = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
-        else:
-            self.training_diagnostics["adv_z_r2"] = np.nan
 
+        # Adversary diagnostics (aligned with training standardization)
+        V_std = _apply_standardize(V_all.astype(np.float32), self._v_mean, self._v_std)
+        V_t = torch.from_numpy(V_std).to(self.device)
+        Y_std = (Y - float(self._y_mean)) / float(self._y_std + 1e-8)
+
+        self.enc_x.eval(); self.enc_w.eval(); self.enc_z.eval(); self.enc_n.eval()
+        self.adv_w.eval(); self.adv_n.eval(); self.adv_z.eval()
+        with torch.no_grad():
+            tx, tw, tz, tn = self._encode_blocks(V_t)
+            adv_w_probs = torch.sigmoid(self.adv_w(tw)).cpu().numpy()
+            adv_n_probs = torch.sigmoid(self.adv_n(tn)).cpu().numpy()
+            adv_z_pred = self.adv_z(tz).cpu().numpy()
+
+        adv_w_acc = float(((adv_w_probs > 0.5) == (A == 1)).mean()) if adv_w_probs.size else np.nan
+        adv_n_acc = float(((adv_n_probs > 0.5) == (A == 1)).mean()) if adv_n_probs.size else np.nan
+        adv_z_r2 = (
+            float(r2_score(Y_std, adv_z_pred)) if np.var(Y_std) > 0 else np.nan
+        )
+
+        self.training_diagnostics.update(
+            {
+                "adv_w_acc": adv_w_acc,
+                "adv_n_acc": adv_n_acc,
+                "adv_z_r2": adv_z_r2,
+            }
+        )
     # --- latent + DR ---
     def get_latent(self, V_all: np.ndarray) -> np.ndarray:
         if not self._is_fit:
@@ -568,31 +576,38 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             U_tr, U_te = U[tr], U[te]
             A_tr, A_te = A[tr], A[te]
             Y_tr, Y_te = Y[tr], Y[te]
+
+            if cfg.standardize_nuisance:
+                scaler_u = StandardScaler().fit(U_tr)
+                U_tr_s = scaler_u.transform(U_tr)
+                U_te_s = scaler_u.transform(U_te)
+            else:
+                U_tr_s, U_te_s = U_tr, U_te
             if np.unique(A_tr).size < 2:
                 e_hat = np.full_like(A_te, float(np.mean(A_tr)) if len(A_tr) else 0.5, dtype=float)
             else:
                 prop = LogisticRegression(max_iter=2000, solver="lbfgs")
-                prop.fit(U_tr, A_tr)
-                e_hat = prop.predict_proba(U_te)[:, 1]
+                prop.fit(U_tr_s, A_tr)
+                e_hat = prop.predict_proba(U_te_s)[:, 1]
             e_hat = np.clip(e_hat, cfg.clip_prop, 1 - cfg.clip_prop)
 
             # Arm-specific outcome models to accommodate heterogeneous effects
             if np.any(A_tr == 1):
-                m1_model: LinearRegression | DummyRegressor = LinearRegression()
-                m1_model.fit(U_tr[A_tr == 1], Y_tr[A_tr == 1])
+                m1_model: Ridge | DummyRegressor = Ridge(alpha=cfg.ridge_alpha)
+                m1_model.fit(U_tr_s[A_tr == 1], Y_tr[A_tr == 1])
             else:
                 m1_model = DummyRegressor(strategy="constant", constant=float(np.mean(Y_tr)))
                 m1_model.fit(np.zeros((1, U_tr.shape[1])), [0.0])
 
             if np.any(A_tr == 0):
-                m0_model: LinearRegression | DummyRegressor = LinearRegression()
-                m0_model.fit(U_tr[A_tr == 0], Y_tr[A_tr == 0])
+                m0_model: Ridge | DummyRegressor = Ridge(alpha=cfg.ridge_alpha)
+                m0_model.fit(U_tr_s[A_tr == 0], Y_tr[A_tr == 0])
             else:
                 m0_model = DummyRegressor(strategy="constant", constant=float(np.mean(Y_tr)))
                 m0_model.fit(np.zeros((1, U_tr.shape[1])), [0.0])
 
-            m1 = m1_model.predict(U_te)
-            m0 = m0_model.predict(U_te)
+            m1 = m1_model.predict(U_te_s)
+            m0 = m0_model.predict(U_te_s)
             m_hat = np.where(A_te == 1, m1, m0)
 
             psi[te] = m1 - m0 + (A_te - e_hat) / (e_hat * (1 - e_hat)) * (Y_te - m_hat)
@@ -675,13 +690,19 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
             tx_te, tw_te, tz_te, tn_te = self._split_latent(U[te])
 
             # Propensity model on [s_logits, tx, tz, (tn)]
-            prop_feats_tr = [s_tr.reshape(-1, 1), tx_tr, tz_tr]
-            prop_feats_te = [s_te.reshape(-1, 1), tx_te, tz_te]
+            s_tr_clipped = np.clip(s_tr, -10, 10)
+            s_te_clipped = np.clip(s_te, -10, 10)
+            prop_feats_tr = [s_tr_clipped.reshape(-1, 1), tx_tr, tz_tr]
+            prop_feats_te = [s_te_clipped.reshape(-1, 1), tx_te, tz_te]
             if tn_tr is not None:
                 prop_feats_tr.append(tn_tr)
                 prop_feats_te.append(tn_te)
             Xp_tr = np.column_stack(prop_feats_tr)
             Xp_te = np.column_stack(prop_feats_te)
+            if cfg.standardize_nuisance:
+                scaler_prop = StandardScaler().fit(Xp_tr)
+                Xp_tr = scaler_prop.transform(Xp_tr)
+                Xp_te = scaler_prop.transform(Xp_te)
             if np.unique(A_tr).size < 2:
                 e_hat = np.full_like(A_te, float(np.mean(A_tr)) if len(A_tr) else 0.5, dtype=float)
             else:
@@ -712,12 +733,16 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
                 out_feats_te.append(A_te[:, None] * tn_te)
             Xo_tr = np.column_stack(out_feats_tr)
             Xo_te = np.column_stack(out_feats_te)
+            if cfg.standardize_nuisance:
+                scaler_out = StandardScaler().fit(Xo_tr)
+                Xo_tr = scaler_out.transform(Xo_tr)
+                Xo_te = scaler_out.transform(Xo_te)
 
             if len(A_tr) == 0:
-                out_model: LinearRegression | DummyRegressor = DummyRegressor(strategy="mean")
+                out_model: Ridge | DummyRegressor = DummyRegressor(strategy="mean")
                 out_model.fit(np.zeros((1, Xo_tr.shape[1])), [0.0])
             else:
-                out_model = LinearRegression()
+                out_model = Ridge(alpha=cfg.ridge_alpha)
                 out_model.fit(Xo_tr, Y_tr)
 
             # counterfactual features using head counterfactual predictions
@@ -742,6 +767,9 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
                 out_feats_0.append(np.zeros_like(tn_te))
             X1 = np.column_stack(out_feats_1)
             X0 = np.column_stack(out_feats_0)
+            if cfg.standardize_nuisance:
+                X1 = scaler_out.transform(X1)
+                X0 = scaler_out.transform(X0)
 
             m_hat = out_model.predict(Xo_te)
             m1 = out_model.predict(X1)
