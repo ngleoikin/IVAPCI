@@ -173,6 +173,14 @@ def _normalize_scenarios(raw: List[str]) -> List[str]:
     return normalized
 
 
+def _progress(msg: str, current: int, total: int, start_time: float) -> None:
+    """Lightweight progress reporter for diagnostics sweeps."""
+
+    elapsed = time.time() - start_time
+    pct = (current / total) * 100 if total else 0.0
+    print(f"[{current}/{total} | {pct:5.1f}% | {elapsed:7.1f}s] {msg}", flush=True)
+
+
 def run_diagnostics(
     scenarios: List[str],
     n_samples: int,
@@ -184,8 +192,11 @@ def run_diagnostics(
     results_path: str,
 ) -> None:
     records = []
+    start_time = time.time()
     for scenario in scenarios:
         seed_list = seeds or [start_seed + rep for rep in range(repetitions)]
+        total = len(seed_list) * len(methods)
+        counter = 0
         for seed in seed_list:
             data = simulate_scenario(scenario, n=n_samples, seed=seed, variant=variant)
             X_all = _concat_features(data)
@@ -202,6 +213,13 @@ def run_diagnostics(
 
             latent_store: Dict[str, Optional[np.ndarray]] = {}
             for method in methods:
+                counter += 1
+                _progress(
+                    f"scenario={scenario} seed={seed} method={method}",
+                    counter,
+                    total,
+                    start_time,
+                )
                 est = _build_estimator(
                     method, x_dim=x_dim, w_dim=w_dim, z_dim=z_dim, n_samples=n_samples, seed=seed
                 )

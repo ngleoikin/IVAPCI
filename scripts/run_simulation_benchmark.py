@@ -117,6 +117,14 @@ def _build_estimator(
     raise ValueError(f"Unsupported method '{name}'.")
 
 
+def _progress(msg: str, current: int, total: int, start_time: float) -> None:
+    """Lightweight progress reporter for long experiment sweeps."""
+
+    elapsed = time.time() - start_time
+    pct = (current / total) * 100 if total else 0.0
+    print(f"[{current}/{total} | {pct:5.1f}% | {elapsed:7.1f}s] {msg}", flush=True)
+
+
 def _concat_features(data: Dict[str, np.ndarray]) -> np.ndarray:
     parts = [p for key in ["X", "W", "Z"] if (p := data.get(key)) is not None]
     if not parts:
@@ -205,8 +213,11 @@ def run_benchmark(
     summary_path: str,
 ) -> None:
     records = []
+    start_time = time.time()
     for scenario in scenarios:
         seed_list = seeds or [start_seed + rep for rep in range(repetitions)]
+        total = len(seed_list) * len(methods)
+        counter = 0
         for seed in seed_list:
             data = simulate_scenario(scenario, n=n_samples, seed=seed, variant=variant)
             X_all = _concat_features(data)
@@ -217,6 +228,13 @@ def run_benchmark(
             w_dim = data.get("W").shape[1] if data.get("W") is not None else 0
             z_dim = data.get("Z").shape[1] if data.get("Z") is not None else 0
             for method in methods:
+                counter += 1
+                _progress(
+                    f"scenario={scenario} seed={seed} method={method}",
+                    counter,
+                    total,
+                    start_time,
+                )
                 est = _build_estimator(
                     method, x_dim=x_dim, w_dim=w_dim, z_dim=z_dim, n_samples=n_samples, seed=seed
                 )
