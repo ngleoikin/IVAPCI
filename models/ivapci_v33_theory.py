@@ -534,7 +534,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         self.training_diagnostics["adv_w_acc"] = float(np.mean(A_pred_w == A)) if len(A) else np.nan
         self.training_diagnostics["adv_n_acc"] = float(np.mean(A_pred_n == A)) if len(A) else np.nan
         if np.var(Y) > 0:
-            y_hat_z = adv_z_pred
+            scale = float(self._y_std.squeeze()) if hasattr(self, "_y_std") else 1.0
+            mean = float(self._y_mean.squeeze()) if hasattr(self, "_y_mean") else 0.0
+            y_hat_z = adv_z_pred * scale + mean
             ss_res = float(np.sum((Y - y_hat_z) ** 2))
             ss_tot = float(np.sum((Y - np.mean(Y)) ** 2))
             self.training_diagnostics["adv_z_r2"] = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
@@ -605,37 +607,18 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
 
 
 class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
-    """Same encoder, plus RADR-style calibration."""
+    """Same encoder, plus RADR-style calibration with fold-specific nuisances."""
 
-    def _split_latent(self, U: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _split_latent(self, U: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
         cfg = self.config
         dx, dw, dz = cfg.latent_x_dim, cfg.latent_w_dim, cfg.latent_z_dim
         tx = U[:, :dx]
         tw = U[:, dx : dx + dw]
         tz = U[:, dx + dw : dx + dw + dz]
-        return tx, tw, tz
-
-    def _destandardize_y(self, y_std: np.ndarray) -> np.ndarray:
-        scale = float(self._y_std.squeeze()) if hasattr(self, "_y_std") else 1.0
-        mean = float(self._y_mean.squeeze()) if hasattr(self, "_y_mean") else 0.0
-        return y_std * scale + mean
-
-    def _head_features(self, U: np.ndarray, A: np.ndarray):
-        tx, tw, tz = self._split_latent(U)
-        A = np.asarray(A, dtype=np.float32).reshape(-1)
-        tx_t = torch.from_numpy(tx.astype(np.float32)).to(self.device)
-        tw_t = torch.from_numpy(tw.astype(np.float32)).to(self.device)
-        tz_t = torch.from_numpy(tz.astype(np.float32)).to(self.device)
-        A_t = torch.from_numpy(A).to(self.device)
-        self.a_head.eval(); self.y_head.eval()
-        with torch.no_grad():
-            s_logits = self.a_head(torch.cat([tx_t, tz_t], dim=1)).cpu().numpy()
-            t_obs_std = self.y_head(torch.cat([tx_t, tw_t], dim=1), A_t).cpu().numpy()
-            ones = torch.ones_like(A_t)
-            zeros = torch.zeros_like(A_t)
-            t1_std = self.y_head(torch.cat([tx_t, tw_t], dim=1), ones).cpu().numpy()
-            t0_std = self.y_head(torch.cat([tx_t, tw_t], dim=1), zeros).cpu().numpy()
-        return s_logits, self._destandardize_y(t_obs_std), self._destandardize_y(t1_std), self._destandardize_y(t0_std)
+        tn: Optional[np.ndarray] = None
+        if cfg.use_noise_in_latent and U.shape[1] > dx + dw + dz:
+            tn = U[:, dx + dw + dz :]
+        return tx, tw, tz, tn
 
     def _dr_ate(self, U: np.ndarray, A: np.ndarray, Y: np.ndarray) -> float:
         cfg = self.config
@@ -643,42 +626,61 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
         A = np.asarray(A).reshape(-1)
         Y = np.asarray(Y).reshape(-1)
 
-        tx, tw, tz = self._split_latent(U)
-        s_logits, t_obs, t1_all, t0_all = self._head_features(U, A)
+        tx, tw, tz, tn = self._split_latent(U)
 
         kf = KFold(n_splits=cfg.n_splits_dr, shuffle=True, random_state=cfg.seed)
         psi = np.zeros_like(Y, dtype=float)
+
         for tr, te in kf.split(U):
             A_tr, A_te = A[tr], A[te]
             Y_tr, Y_te = Y[tr], Y[te]
             tx_tr, tx_te = tx[tr], tx[te]
             tw_tr, tw_te = tw[tr], tw[te]
             tz_tr, tz_te = tz[tr], tz[te]
-            s_tr, s_te = s_logits[tr], s_logits[te]
-            t_tr, t_te = t_obs[tr], t_obs[te]
-            t1_te, t0_te = t1_all[te], t0_all[te]
+            tn_tr = tn_te = None
+            if tn is not None:
+                tn_tr, tn_te = tn[tr], tn[te]
 
+            # propensity on [tx, tz, (tn)] trained per fold
+            prop_feats_tr = [tx_tr, tz_tr] + ([tn_tr] if tn_tr is not None else [])
+            prop_feats_te = [tx_te, tz_te] + ([tn_te] if tn_te is not None else [])
+            Xp_tr = np.column_stack(prop_feats_tr)
+            Xp_te = np.column_stack(prop_feats_te)
             if np.unique(A_tr).size < 2:
                 e_hat = np.full_like(A_te, float(np.mean(A_tr)) if len(A_tr) else 0.5, dtype=float)
             else:
                 prop = LogisticRegression(max_iter=2000, solver="lbfgs")
-                Xp_tr = np.column_stack([s_tr, tx_tr, tz_tr])
-                Xp_te = np.column_stack([s_te, tx_te, tz_te])
                 prop.fit(Xp_tr, A_tr)
                 e_hat = prop.predict_proba(Xp_te)[:, 1]
             e_hat = np.clip(e_hat, cfg.clip_prop, 1 - cfg.clip_prop)
 
-            Xo_tr = np.column_stack([A_tr, tx_tr, tw_tr, t_tr, A_tr * t_tr])
-            if len(A_tr) == 0:
-                out: LinearRegression | DummyRegressor = DummyRegressor(strategy="mean").fit(np.zeros((1, Xo_tr.shape[1])), [0.0])
-            else:
-                out = LinearRegression(); out.fit(Xo_tr, Y_tr)
+            # outcome on [A, tx, tw, (tn), interactions]
+            def _out_feats(a_vec, tx_part, tw_part, tn_part):
+                parts = [a_vec, tx_part, tw_part]
+                if tn_part is not None:
+                    parts.append(tn_part)
+                parts.append(a_vec[:, None] * tx_part)
+                parts.append(a_vec[:, None] * tw_part)
+                if tn_part is not None:
+                    parts.append(a_vec[:, None] * tn_part)
+                return np.column_stack(parts)
 
-            Xo_te = np.column_stack([A_te, tx_te, tw_te, t_te, A_te * t_te])
+            Xo_tr = _out_feats(A_tr, tx_tr, tw_tr, tn_tr)
+            if len(A_tr) == 0:
+                out: LinearRegression | DummyRegressor = DummyRegressor(strategy="mean")
+                out.fit(np.zeros((1, Xo_tr.shape[1])), [0.0])
+            else:
+                out = LinearRegression()
+                out.fit(Xo_tr, Y_tr)
+
+            Xo_te = _out_feats(A_te, tx_te, tw_te, tn_te)
             m_hat = out.predict(Xo_te)
-            X1 = np.column_stack([np.ones_like(A_te), tx_te, tw_te, t1_te, t1_te])
-            X0 = np.column_stack([np.zeros_like(A_te), tx_te, tw_te, t0_te, np.zeros_like(t0_te)])
-            m1 = out.predict(X1); m0 = out.predict(X0)
+
+            X1 = _out_feats(np.ones_like(A_te), tx_te, tw_te, tn_te)
+            X0 = _out_feats(np.zeros_like(A_te), tx_te, tw_te, tn_te)
+            m1 = out.predict(X1)
+            m0 = out.predict(X0)
+
             psi[te] = m1 - m0 + (A_te - e_hat) / (e_hat * (1 - e_hat)) * (Y_te - m_hat)
 
         return float(np.mean(psi))
