@@ -609,6 +609,40 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
 class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
     """Same encoder, plus RADR-style calibration with fold-specific nuisances."""
 
+    # ---- helpers for RADR features ----
+    def _destandardize_y(self, y_std: np.ndarray) -> np.ndarray:
+        scale = float(self._y_std.squeeze()) if hasattr(self, "_y_std") else 1.0
+        mean = float(self._y_mean.squeeze()) if hasattr(self, "_y_mean") else 0.0
+        return y_std * scale + mean
+
+    def _head_features(
+        self, U: np.ndarray, A: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Propensity/outcome head predictions for RADR nuisance models."""
+
+        tx, tw, tz, tn = self._split_latent(U)
+        A = np.asarray(A, dtype=np.float32).reshape(-1)
+
+        tx_t = torch.from_numpy(tx.astype(np.float32)).to(self.device)
+        tw_t = torch.from_numpy(tw.astype(np.float32)).to(self.device)
+        tz_t = torch.from_numpy(tz.astype(np.float32)).to(self.device)
+        A_t = torch.from_numpy(A).to(self.device)
+
+        self.a_head.eval()
+        self.y_head.eval()
+        with torch.no_grad():
+            s_logits = self.a_head(torch.cat([tx_t, tz_t], dim=1)).cpu().numpy()
+            t_obs_std = self.y_head(torch.cat([tx_t, tw_t], dim=1), A_t).cpu().numpy()
+            ones = torch.ones_like(A_t)
+            zeros = torch.zeros_like(A_t)
+            t1_std = self.y_head(torch.cat([tx_t, tw_t], dim=1), ones).cpu().numpy()
+            t0_std = self.y_head(torch.cat([tx_t, tw_t], dim=1), zeros).cpu().numpy()
+
+        t_obs = self._destandardize_y(t_obs_std)
+        t1 = self._destandardize_y(t1_std)
+        t0 = self._destandardize_y(t0_std)
+        return s_logits, t_obs, t1, t0
+
     def _split_latent(self, U: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
         cfg = self.config
         dx, dw, dz = cfg.latent_x_dim, cfg.latent_w_dim, cfg.latent_z_dim
@@ -626,24 +660,26 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
         A = np.asarray(A).reshape(-1)
         Y = np.asarray(Y).reshape(-1)
 
-        tx, tw, tz, tn = self._split_latent(U)
-
         kf = KFold(n_splits=cfg.n_splits_dr, shuffle=True, random_state=cfg.seed)
         psi = np.zeros_like(Y, dtype=float)
 
         for tr, te in kf.split(U):
             A_tr, A_te = A[tr], A[te]
             Y_tr, Y_te = Y[tr], Y[te]
-            tx_tr, tx_te = tx[tr], tx[te]
-            tw_tr, tw_te = tw[tr], tw[te]
-            tz_tr, tz_te = tz[tr], tz[te]
-            tn_tr = tn_te = None
-            if tn is not None:
-                tn_tr, tn_te = tn[tr], tn[te]
 
-            # propensity on [tx, tz, (tn)] trained per fold
-            prop_feats_tr = [tx_tr, tz_tr] + ([tn_tr] if tn_tr is not None else [])
-            prop_feats_te = [tx_te, tz_te] + ([tn_te] if tn_te is not None else [])
+            # head predictions (fold-specific split of data, heads are pre-trained)
+            s_tr, t_obs_tr, t1_tr, t0_tr = self._head_features(U[tr], A_tr)
+            s_te, t_obs_te, t1_te, t0_te = self._head_features(U[te], A_te)
+
+            tx_tr, tw_tr, tz_tr, tn_tr = self._split_latent(U[tr])
+            tx_te, tw_te, tz_te, tn_te = self._split_latent(U[te])
+
+            # Propensity model on [s_logits, tx, tz, (tn)]
+            prop_feats_tr = [s_tr.reshape(-1, 1), tx_tr, tz_tr]
+            prop_feats_te = [s_te.reshape(-1, 1), tx_te, tz_te]
+            if tn_tr is not None:
+                prop_feats_tr.append(tn_tr)
+                prop_feats_te.append(tn_te)
             Xp_tr = np.column_stack(prop_feats_tr)
             Xp_te = np.column_stack(prop_feats_te)
             if np.unique(A_tr).size < 2:
@@ -654,32 +690,62 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
                 e_hat = prop.predict_proba(Xp_te)[:, 1]
             e_hat = np.clip(e_hat, cfg.clip_prop, 1 - cfg.clip_prop)
 
-            # outcome on [A, tx, tw, (tn), interactions]
-            def _out_feats(a_vec, tx_part, tw_part, tn_part):
-                parts = [a_vec, tx_part, tw_part]
-                if tn_part is not None:
-                    parts.append(tn_part)
-                parts.append(a_vec[:, None] * tx_part)
-                parts.append(a_vec[:, None] * tw_part)
-                if tn_part is not None:
-                    parts.append(a_vec[:, None] * tn_part)
-                return np.column_stack(parts)
+            # Outcome model on [A, tx, tw, t_obs, A*t_obs, (tn, A*tn)]
+            out_feats_tr = [
+                A_tr.reshape(-1, 1),
+                tx_tr,
+                tw_tr,
+                t_obs_tr.reshape(-1, 1),
+                (A_tr * t_obs_tr).reshape(-1, 1),
+            ]
+            out_feats_te = [
+                A_te.reshape(-1, 1),
+                tx_te,
+                tw_te,
+                t_obs_te.reshape(-1, 1),
+                (A_te * t_obs_te).reshape(-1, 1),
+            ]
+            if tn_tr is not None:
+                out_feats_tr.append(tn_tr)
+                out_feats_tr.append(A_tr[:, None] * tn_tr)
+                out_feats_te.append(tn_te)
+                out_feats_te.append(A_te[:, None] * tn_te)
+            Xo_tr = np.column_stack(out_feats_tr)
+            Xo_te = np.column_stack(out_feats_te)
 
-            Xo_tr = _out_feats(A_tr, tx_tr, tw_tr, tn_tr)
             if len(A_tr) == 0:
-                out: LinearRegression | DummyRegressor = DummyRegressor(strategy="mean")
-                out.fit(np.zeros((1, Xo_tr.shape[1])), [0.0])
+                out_model: LinearRegression | DummyRegressor = DummyRegressor(strategy="mean")
+                out_model.fit(np.zeros((1, Xo_tr.shape[1])), [0.0])
             else:
-                out = LinearRegression()
-                out.fit(Xo_tr, Y_tr)
+                out_model = LinearRegression()
+                out_model.fit(Xo_tr, Y_tr)
 
-            Xo_te = _out_feats(A_te, tx_te, tw_te, tn_te)
-            m_hat = out.predict(Xo_te)
+            # counterfactual features using head counterfactual predictions
+            out_feats_1 = [
+                np.ones_like(A_te).reshape(-1, 1),
+                tx_te,
+                tw_te,
+                t1_te.reshape(-1, 1),
+                t1_te.reshape(-1, 1),
+            ]
+            out_feats_0 = [
+                np.zeros_like(A_te).reshape(-1, 1),
+                tx_te,
+                tw_te,
+                t0_te.reshape(-1, 1),
+                np.zeros_like(t0_te).reshape(-1, 1),
+            ]
+            if tn_te is not None:
+                out_feats_1.append(tn_te)
+                out_feats_1.append(tn_te)
+                out_feats_0.append(tn_te)
+                out_feats_0.append(np.zeros_like(tn_te))
+            X1 = np.column_stack(out_feats_1)
+            X0 = np.column_stack(out_feats_0)
 
-            X1 = _out_feats(np.ones_like(A_te), tx_te, tw_te, tn_te)
-            X0 = _out_feats(np.zeros_like(A_te), tx_te, tw_te, tn_te)
-            m1 = out.predict(X1)
-            m0 = out.predict(X0)
+            m_hat = out_model.predict(Xo_te)
+            m1 = out_model.predict(X1)
+            m0 = out_model.predict(X0)
 
             psi[te] = m1 - m0 + (A_te - e_hat) / (e_hat * (1 - e_hat)) * (Y_te - m_hat)
 
