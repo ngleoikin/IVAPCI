@@ -249,6 +249,9 @@ class IVAPCIV33TheoryConfig:
 
     n_splits_dr: int = 2
     clip_prop: float = 5e-3
+    clip_prop_radr: float = 1e-2
+    ipw_cap: float = 20.0
+    ipw_cap_radr: float = 20.0
 
     seed: int = 42
     device: str = "cpu"
@@ -657,7 +660,11 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             m0 = m0_model.predict(U_te_s)
             m_hat = np.where(A_te == 1, m1, m0)
 
-            psi[te] = m1 - m0 + (A_te - e_hat) / (e_hat * (1 - e_hat)) * (Y_te - m_hat)
+            w = (A_te - e_hat) / (e_hat * (1 - e_hat))
+            if cfg.ipw_cap and cfg.ipw_cap > 0:
+                w = np.clip(w, -float(cfg.ipw_cap), float(cfg.ipw_cap))
+
+            psi[te] = m1 - m0 + w * (Y_te - m_hat)
         return float(np.mean(psi))
 
     def estimate_ate(self, V_all: np.ndarray, A: np.ndarray, Y: np.ndarray) -> float:
@@ -724,6 +731,8 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
 
         kf = KFold(n_splits=cfg.n_splits_dr, shuffle=True, random_state=cfg.seed)
         psi = np.zeros_like(Y, dtype=float)
+        clip = float(max(cfg.clip_prop_radr, cfg.clip_prop))
+        ipw_cap = cfg.ipw_cap_radr if getattr(cfg, "ipw_cap_radr", None) is not None else cfg.ipw_cap
 
         for tr, te in kf.split(U):
             A_tr, A_te = A[tr], A[te]
@@ -756,7 +765,7 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
                 prop = LogisticRegression(max_iter=2000, solver="lbfgs")
                 prop.fit(Xp_tr, A_tr)
                 e_hat = prop.predict_proba(Xp_te)[:, 1]
-            e_hat = np.clip(e_hat, cfg.clip_prop, 1 - cfg.clip_prop)
+            e_hat = np.clip(e_hat, clip, 1 - clip)
 
             def _outcome_features(a_vec, tx_block, tw_block, t_val, tn_block):
                 """Construct outcome design matrix with treatment interactions.
@@ -806,7 +815,11 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
             m1 = out_model.predict(X1)
             m0 = out_model.predict(X0)
 
-            psi[te] = m1 - m0 + (A_te - e_hat) / (e_hat * (1 - e_hat)) * (Y_te - m_hat)
+            w = (A_te - e_hat) / (e_hat * (1 - e_hat))
+            if ipw_cap and ipw_cap > 0:
+                w = np.clip(w, -float(ipw_cap), float(ipw_cap))
+
+            psi[te] = m1 - m0 + w * (Y_te - m_hat)
 
         return float(np.mean(psi))
 
