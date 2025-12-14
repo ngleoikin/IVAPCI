@@ -315,23 +315,22 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
     # --- model wiring ---
     def _build(self, d_all: int) -> None:
         cfg = self.config
-        self._block_slices = None
-        if cfg.x_dim and cfg.w_dim and cfg.z_dim:
-            if cfg.x_dim + cfg.w_dim + cfg.z_dim != d_all:
-                raise ValueError("x_dim + w_dim + z_dim must equal input dimension")
-            self._block_slices = (
-                slice(0, cfg.x_dim),
-                slice(cfg.x_dim, cfg.x_dim + cfg.w_dim),
-                slice(cfg.x_dim + cfg.w_dim, cfg.x_dim + cfg.w_dim + cfg.z_dim),
-            )
+        if not (cfg.x_dim and cfg.w_dim and cfg.z_dim):
+            raise ValueError("IVAPCI v3.3 requires x_dim, w_dim, z_dim to split X|W|Z blocks")
+        if cfg.x_dim + cfg.w_dim + cfg.z_dim != d_all:
+            raise ValueError("x_dim + w_dim + z_dim must equal input dimension")
 
-        x_in = cfg.x_dim if self._block_slices else d_all
-        w_in = cfg.w_dim if self._block_slices else d_all
-        z_in = cfg.z_dim if self._block_slices else d_all
+        self._block_slices = (
+            slice(0, cfg.x_dim),
+            slice(cfg.x_dim, cfg.x_dim + cfg.w_dim),
+            slice(cfg.x_dim + cfg.w_dim, cfg.x_dim + cfg.w_dim + cfg.z_dim),
+        )
 
-        self.enc_x = _GroupEncoder(x_in, cfg.enc_x_hidden, cfg.latent_x_dim).to(self.device)
-        self.enc_w = _GroupEncoder(w_in, cfg.enc_w_hidden, cfg.latent_w_dim).to(self.device)
-        self.enc_z = _GroupEncoder(z_in, cfg.enc_z_hidden, cfg.latent_z_dim, dropout=cfg.dropout_z).to(self.device)
+        self.enc_x = _GroupEncoder(cfg.x_dim, cfg.enc_x_hidden, cfg.latent_x_dim).to(self.device)
+        self.enc_w = _GroupEncoder(cfg.w_dim, cfg.enc_w_hidden, cfg.latent_w_dim).to(self.device)
+        self.enc_z = _GroupEncoder(cfg.z_dim, cfg.enc_z_hidden, cfg.latent_z_dim, dropout=cfg.dropout_z).to(
+            self.device
+        )
         self.enc_n = _GroupEncoder(d_all, cfg.enc_n_hidden, cfg.latent_n_dim).to(self.device)
 
         total_lat = cfg.latent_x_dim + cfg.latent_w_dim + cfg.latent_z_dim + cfg.latent_n_dim
@@ -367,8 +366,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
     def _split_blocks_tensor(
         self, V_t: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self._block_slices is None:
-            return V_t, V_t, V_t
+        assert self._block_slices is not None, "Block slices must be initialized in _build"
         return (
             V_t[:, self._block_slices[0]],
             V_t[:, self._block_slices[1]],
