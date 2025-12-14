@@ -249,9 +249,12 @@ class IVAPCIV33TheoryConfig:
 
     n_splits_dr: int = 2
     clip_prop: float = 5e-3
+    clip_prop_adaptive_max: float = 1e-2
     clip_prop_radr: float = 1e-2
     ipw_cap: float = 20.0
-    ipw_cap_radr: float = 20.0
+    ipw_cap_high: float = 100.0
+    ipw_cap_radr: Optional[float] = None
+    adaptive_ipw: bool = True
 
     seed: int = 42
     device: str = "cpu"
