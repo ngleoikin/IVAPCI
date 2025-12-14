@@ -760,28 +760,27 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
                 e_hat = prop.predict_proba(Xp_te)[:, 1]
             e_hat = np.clip(e_hat, cfg.clip_prop, 1 - cfg.clip_prop)
 
-            # Outcome model on [A, tx, tw, t_obs, A*t_obs, (tn, A*tn)]
-            out_feats_tr = [
-                A_tr.reshape(-1, 1),
-                tx_tr,
-                tw_tr,
-                t_obs_tr.reshape(-1, 1),
-                (A_tr * t_obs_tr).reshape(-1, 1),
-            ]
-            out_feats_te = [
-                A_te.reshape(-1, 1),
-                tx_te,
-                tw_te,
-                t_obs_te.reshape(-1, 1),
-                (A_te * t_obs_te).reshape(-1, 1),
-            ]
-            if tn_tr is not None:
-                out_feats_tr.append(tn_tr)
-                out_feats_tr.append(A_tr[:, None] * tn_tr)
-                out_feats_te.append(tn_te)
-                out_feats_te.append(A_te[:, None] * tn_te)
-            Xo_tr = np.column_stack(out_feats_tr)
-            Xo_te = np.column_stack(out_feats_te)
+            def _outcome_features(a_vec, tx_block, tw_block, t_val, tn_block):
+                """Construct outcome design matrix with treatment interactions.
+
+                Columns: [A, tx, tw, t_val, A*t_val, A*tx, A*tw, (tn), (A*tn)]
+                """
+                feats = [
+                    a_vec.reshape(-1, 1),
+                    tx_block,
+                    tw_block,
+                    t_val.reshape(-1, 1),
+                    (a_vec * t_val).reshape(-1, 1),
+                    (a_vec[:, None] * tx_block),
+                    (a_vec[:, None] * tw_block),
+                ]
+                if tn_block is not None:
+                    feats.append(tn_block)
+                    feats.append(a_vec[:, None] * tn_block)
+                return np.column_stack(feats)
+
+            Xo_tr = _outcome_features(A_tr, tx_tr, tw_tr, t_obs_tr, tn_tr)
+            Xo_te = _outcome_features(A_te, tx_te, tw_te, t_obs_te, tn_te)
             if cfg.standardize_nuisance:
                 scaler_out = StandardScaler().fit(Xo_tr)
                 Xo_tr = scaler_out.transform(Xo_tr)
@@ -795,27 +794,12 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
                 out_model.fit(Xo_tr, Y_tr)
 
             # counterfactual features using head counterfactual predictions
-            out_feats_1 = [
-                np.ones_like(A_te).reshape(-1, 1),
-                tx_te,
-                tw_te,
-                t1_te.reshape(-1, 1),
-                t1_te.reshape(-1, 1),
-            ]
-            out_feats_0 = [
-                np.zeros_like(A_te).reshape(-1, 1),
-                tx_te,
-                tw_te,
-                t0_te.reshape(-1, 1),
-                np.zeros_like(t0_te).reshape(-1, 1),
-            ]
-            if tn_te is not None:
-                out_feats_1.append(tn_te)
-                out_feats_1.append(tn_te)
-                out_feats_0.append(tn_te)
-                out_feats_0.append(np.zeros_like(tn_te))
-            X1 = np.column_stack(out_feats_1)
-            X0 = np.column_stack(out_feats_0)
+            X1 = _outcome_features(
+                np.ones_like(A_te), tx_te, tw_te, t1_te, tn_te
+            )
+            X0 = _outcome_features(
+                np.zeros_like(A_te), tx_te, tw_te, t0_te, tn_te
+            )
             if cfg.standardize_nuisance:
                 X1 = scaler_out.transform(X1)
                 X0 = scaler_out.transform(X0)
