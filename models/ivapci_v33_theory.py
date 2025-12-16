@@ -795,9 +795,9 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
                 "overlap_score",
                 "frac_e_clipped",
                 "ipw_abs_max_raw",
+                "ipw_abs_max_postclip_precap",
                 "ipw_abs_max_capped",
                 "frac_ipw_capped",
-                "ipw_abs_max_raw_unclipped",
                 "frac_ipw_capped_raw",
             ]
         }
@@ -909,13 +909,13 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
             stats["ipw_abs_max_raw"].append(float(np.max(np.abs(w_raw))) if w_raw.size else np.nan)
             # post-clip (propensity) but pre-cap weights
             w = (A_te - e_hat) / (e_hat * (1 - e_hat))
-            stats["ipw_abs_max_raw_unclipped"].append(float(np.max(np.abs(w))) if w.size else np.nan)
+            stats["ipw_abs_max_postclip_precap"].append(float(np.max(np.abs(w))) if w.size else np.nan)
 
             w_capped = np.clip(w, -float(ipw_cap), float(ipw_cap)) if ipw_cap and ipw_cap > 0 else w
             stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w_capped))) if w_capped.size else np.nan)
             if ipw_cap and ipw_cap > 0:
                 stats["frac_ipw_capped"].append(
-                    float(np.mean(np.abs(w_raw) >= float(ipw_cap))) if w_raw.size else np.nan
+                    float(np.mean(np.abs(w) >= float(ipw_cap))) if w.size else np.nan
                 )
                 stats["frac_ipw_capped_raw"].append(
                     float(np.mean(np.abs(w_raw) >= float(ipw_cap))) if w_raw.size else np.nan
