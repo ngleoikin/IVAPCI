@@ -9,6 +9,7 @@ metrics, and produces both per-run and aggregated CSV summaries.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -40,6 +41,28 @@ from models.ivapci_v33_theory import (
 )
 from models.pacdt_v30 import PACDTv30Estimator
 from simulators.simulators import list_scenarios, simulate_scenario
+
+
+def _flatten_train_diag(d: dict, prefix: str = "") -> Dict[str, object]:
+    """Flatten nested diagnostics for CSV output.
+
+    Dicts are expanded with underscore-joined keys, lists/tuples are JSON encoded,
+    and other values fall back to their original representation.
+    """
+
+    if not isinstance(d, dict):
+        return {}
+
+    flat: Dict[str, object] = {}
+    for k, v in d.items():
+        key = f"{prefix}{k}" if not prefix else f"{prefix}_{k}"
+        if isinstance(v, dict):
+            flat.update(_flatten_train_diag(v, prefix=key))
+        elif isinstance(v, (list, tuple)):
+            flat[key] = json.dumps(v)
+        else:
+            flat[key] = v
+    return flat
 
 
 def _build_estimator(
@@ -276,24 +299,27 @@ def run_benchmark(
                 adv_w_acc = train_diag.get("adv_w_acc", np.nan)
                 adv_n_acc = train_diag.get("adv_n_acc", np.nan)
                 adv_z_r2 = train_diag.get("adv_z_r2", np.nan)
-                records.append(
-                    {
-                        "scenario": scenario,
-                        "seed": seed,
-                        "method": method,
-                        "tau_true": tau_true,
-                        "ate_hat": ate_hat,
-                        "abs_err": abs_err,
-                        "sq_err": sq_err,
-                        "runtime_sec": runtime,
-                        "r2_U": r2_u,
-                        "protected_features": protected,
-                        "info_loss_proxy": info_loss,
-                        "adv_w_acc": adv_w_acc,
-                        "adv_n_acc": adv_n_acc,
-                        "adv_z_r2": adv_z_r2,
-                    }
-                )
+                row = {
+                    "scenario": scenario,
+                    "seed": seed,
+                    "method": method,
+                    "tau_true": tau_true,
+                    "ate_hat": ate_hat,
+                    "abs_err": abs_err,
+                    "sq_err": sq_err,
+                    "runtime_sec": runtime,
+                    "r2_U": r2_u,
+                    "protected_features": protected,
+                    "info_loss_proxy": info_loss,
+                    "adv_w_acc": adv_w_acc,
+                    "adv_n_acc": adv_n_acc,
+                    "adv_z_r2": adv_z_r2,
+                }
+
+                for diag_key, diag_val in _flatten_train_diag(train_diag).items():
+                    row.setdefault(diag_key, diag_val)
+
+                records.append(row)
 
     df = pd.DataFrame.from_records(records)
     df.to_csv(results_path, index=False)

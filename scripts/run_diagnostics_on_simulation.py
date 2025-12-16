@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -40,6 +41,29 @@ from models.ivapci_v33_theory import (
 )
 from models.pacdt_v30 import PACDTv30Estimator
 from simulators.simulators import list_scenarios, simulate_scenario
+
+
+def _flatten_train_diag(d: dict, prefix: str = "") -> Dict[str, object]:
+    """Flatten nested diagnostics into a single-level dict.
+
+    * Nested dict keys are concatenated with underscores.
+    * Lists/tuples are JSON-stringified for safe CSV writing.
+    * Other non-primitive values fall back to ``str``.
+    """
+
+    if not isinstance(d, dict):
+        return {}
+
+    flat: Dict[str, object] = {}
+    for k, v in d.items():
+        key = f"{prefix}{k}" if not prefix else f"{prefix}_{k}"
+        if isinstance(v, dict):
+            flat.update(_flatten_train_diag(v, prefix=key))
+        elif isinstance(v, (list, tuple)):
+            flat[key] = json.dumps(v)
+        else:
+            flat[key] = v
+    return flat
 
 
 def _build_estimator(
@@ -271,6 +295,10 @@ def run_diagnostics(
                     "adv_n_acc": train_diag.get("adv_n_acc", np.nan),
                     "adv_z_r2": train_diag.get("adv_z_r2", np.nan),
                 }
+
+                # Append any additional diagnostics without overwriting fixed fields
+                for diag_key, diag_val in _flatten_train_diag(train_diag).items():
+                    row.setdefault(diag_key, diag_val)
 
                 if method in {
                     "ivapci_v2_1",
