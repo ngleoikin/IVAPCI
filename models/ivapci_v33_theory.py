@@ -837,7 +837,9 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
 
             stats["clip_used"].append(float(clip_use))
             stats["cap_used"].append(float(cap_use) if cap_use is not None else np.nan)
-            stats["overlap_score"].append(float(0.0))
+            eps = max(clip_use, 0.05)
+            overlap_score = float(np.mean((e_raw > eps) & (e_raw < 1 - eps))) if e_raw.size else np.nan
+            stats["overlap_score"].append(overlap_score)
             stats["frac_e_clipped"].append(float(np.mean((e_raw < clip_use) | (e_raw > 1 - clip_use))))
             for k, v in qs.items():
                 stats[f"e_{k}"].append(v)
@@ -881,12 +883,11 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
             m1 = out_model.predict(X1)
             m0 = out_model.predict(X0)
 
-            w = (A_te - e_hat) / (e_hat * (1 - e_hat))
-            stats["ipw_abs_max_raw"].append(float(np.max(np.abs(w))) if w.size else np.nan)
-            if ipw_cap and ipw_cap > 0:
-                w = np.clip(w, -float(ipw_cap), float(ipw_cap))
+            w_raw = (A_te - e_hat) / (e_hat * (1 - e_hat))
+            stats["ipw_abs_max_raw"].append(float(np.max(np.abs(w_raw))) if w_raw.size else np.nan)
+            w = np.clip(w_raw, -float(ipw_cap), float(ipw_cap)) if ipw_cap and ipw_cap > 0 else w_raw
             stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w))) if w.size else np.nan)
-            stats["frac_ipw_capped"].append(float(np.mean(np.abs(w) > float(ipw_cap))) if w.size else np.nan)
+            stats["frac_ipw_capped"].append(float(np.mean(np.abs(w_raw) > float(ipw_cap))) if w_raw.size else np.nan)
 
             psi[te] = m1 - m0 + w * (Y_te - m_hat)
 
