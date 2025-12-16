@@ -25,7 +25,6 @@ def _info_aware_standardize(
     train: np.ndarray,
     min_std: float = 1e-2,
     low_var_min_std: float = 1e-4,
-    clip_value: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Standardize while *clamping* (not flattening) near-constant dimensions.
 
