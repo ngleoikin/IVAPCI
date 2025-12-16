@@ -46,8 +46,10 @@ from simulators.simulators import list_scenarios, simulate_scenario
 def _flatten_train_diag(d: dict, prefix: str = "") -> Dict[str, object]:
     """Flatten nested diagnostics for CSV output.
 
-    Dicts are expanded with underscore-joined keys, lists/tuples are JSON encoded,
-    and other values fall back to their original representation.
+    Dicts are expanded with underscore-joined keys. Lists/tuples are JSON
+    encoded with a safe fallback for non-serializable types, and other values
+    are converted to a basic Python representation (via ``str`` as a final
+    fallback) to avoid serialization errors when writing CSV.
     """
 
     if not isinstance(d, dict):
@@ -59,8 +61,12 @@ def _flatten_train_diag(d: dict, prefix: str = "") -> Dict[str, object]:
         if isinstance(v, dict):
             flat.update(_flatten_train_diag(v, prefix=key))
         elif isinstance(v, (list, tuple)):
-            flat[key] = json.dumps(v)
+            try:
+                flat[key] = json.dumps(v, default=str)
+            except Exception:
+                flat[key] = str(v)
         else:
+            # Handle numpy scalars or other non-serializable values gracefully
             flat[key] = v
     return flat
 

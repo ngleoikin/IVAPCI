@@ -47,8 +47,8 @@ def _flatten_train_diag(d: dict, prefix: str = "") -> Dict[str, object]:
     """Flatten nested diagnostics into a single-level dict.
 
     * Nested dict keys are concatenated with underscores.
-    * Lists/tuples are JSON-stringified for safe CSV writing.
-    * Other non-primitive values fall back to ``str``.
+    * Lists/tuples are JSON-stringified (with safe fallback) for CSV writing.
+    * Other non-primitive values fall back to ``str`` when needed.
     """
 
     if not isinstance(d, dict):
@@ -60,7 +60,10 @@ def _flatten_train_diag(d: dict, prefix: str = "") -> Dict[str, object]:
         if isinstance(v, dict):
             flat.update(_flatten_train_diag(v, prefix=key))
         elif isinstance(v, (list, tuple)):
-            flat[key] = json.dumps(v)
+            try:
+                flat[key] = json.dumps(v, default=str)
+            except Exception:
+                flat[key] = str(v)
         else:
             flat[key] = v
     return flat
