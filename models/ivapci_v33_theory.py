@@ -623,6 +623,24 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         U = np.asarray(U)
         A = np.asarray(A).reshape(-1)
         Y = np.asarray(Y).reshape(-1)
+        stats = {k: [] for k in [
+            "e_min", "e_max", "e_q01", "e_q05", "e_q95", "e_q99",
+            "clip_used", "cap_used", "frac_e_clipped",
+            "ipw_abs_max_raw", "ipw_abs_max_capped", "frac_ipw_capped",
+        ]}
+
+        def _quantiles(x: np.ndarray) -> Dict[str, float]:
+            if x.size == 0:
+                return {"min": np.nan, "max": np.nan, "q01": np.nan, "q05": np.nan, "q95": np.nan, "q99": np.nan}
+            return {
+                "min": float(np.min(x)),
+                "max": float(np.max(x)),
+                "q01": float(np.quantile(x, 0.01)),
+                "q05": float(np.quantile(x, 0.05)),
+                "q95": float(np.quantile(x, 0.95)),
+                "q99": float(np.quantile(x, 0.99)),
+            }
+
         kf = KFold(n_splits=cfg.n_splits_dr, shuffle=True, random_state=cfg.seed)
         psi = np.zeros_like(Y, dtype=float)
         for tr, te in kf.split(U):
@@ -637,12 +655,21 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             else:
                 U_tr_s, U_te_s = U_tr, U_te
             if np.unique(A_tr).size < 2:
-                e_hat = np.full_like(A_te, float(np.mean(A_tr)) if len(A_tr) else 0.5, dtype=float)
+                e_raw = np.full_like(A_te, float(np.mean(A_tr)) if len(A_tr) else 0.5, dtype=float)
             else:
                 prop = LogisticRegression(max_iter=2000, solver="lbfgs")
                 prop.fit(U_tr_s, A_tr)
-                e_hat = prop.predict_proba(U_te_s)[:, 1]
-            e_hat = np.clip(e_hat, cfg.clip_prop, 1 - cfg.clip_prop)
+                e_raw = prop.predict_proba(U_te_s)[:, 1]
+            clip_use = float(cfg.clip_prop)
+            cap_use = float(cfg.ipw_cap) if cfg.ipw_cap is not None else np.nan
+            e_hat = np.clip(e_raw, clip_use, 1 - clip_use)
+
+            qs = _quantiles(e_raw)
+            for k, v in qs.items():
+                stats[f"e_{k}"].append(v)
+            stats["clip_used"].append(clip_use)
+            stats["cap_used"].append(cap_use)
+            stats["frac_e_clipped"].append(float(np.mean((e_raw < clip_use) | (e_raw > 1 - clip_use))))
 
             # Arm-specific outcome models to accommodate heterogeneous effects
             if np.any(A_tr == 1):
@@ -664,10 +691,16 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             m_hat = np.where(A_te == 1, m1, m0)
 
             w = (A_te - e_hat) / (e_hat * (1 - e_hat))
+            stats["ipw_abs_max_raw"].append(float(np.max(np.abs(w))) if w.size else np.nan)
             if cfg.ipw_cap and cfg.ipw_cap > 0:
                 w = np.clip(w, -float(cfg.ipw_cap), float(cfg.ipw_cap))
+                stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w))) if w.size else np.nan)
+                stats["frac_ipw_capped"].append(float(np.mean(np.abs(w) >= float(cfg.ipw_cap))) if w.size else np.nan)
 
             psi[te] = m1 - m0 + w * (Y_te - m_hat)
+        if stats and hasattr(self, "training_diagnostics"):
+            agg = {k: float(np.nanmean(v)) for k, v in stats.items() if v}
+            self.training_diagnostics.update({f"dr_{k}": v for k, v in agg.items()})
         return float(np.mean(psi))
 
     def estimate_ate(self, V_all: np.ndarray, A: np.ndarray, Y: np.ndarray) -> float:
@@ -731,6 +764,36 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
         U = np.asarray(U)
         A = np.asarray(A).reshape(-1)
         Y = np.asarray(Y).reshape(-1)
+        stats: Dict[str, list] = {
+            k: []
+            for k in [
+                "e_min",
+                "e_max",
+                "e_q01",
+                "e_q05",
+                "e_q95",
+                "e_q99",
+                "clip_used",
+                "cap_used",
+                "overlap_score",
+                "frac_e_clipped",
+                "ipw_abs_max_raw",
+                "ipw_abs_max_capped",
+                "frac_ipw_capped",
+            ]
+        }
+
+        def _quantiles(x: np.ndarray) -> Dict[str, float]:
+            if x.size == 0:
+                return {"min": np.nan, "max": np.nan, "q01": np.nan, "q05": np.nan, "q95": np.nan, "q99": np.nan}
+            return {
+                "min": float(np.min(x)),
+                "max": float(np.max(x)),
+                "q01": float(np.quantile(x, 0.01)),
+                "q05": float(np.quantile(x, 0.05)),
+                "q95": float(np.quantile(x, 0.95)),
+                "q99": float(np.quantile(x, 0.99)),
+            }
 
         kf = KFold(n_splits=cfg.n_splits_dr, shuffle=True, random_state=cfg.seed)
         psi = np.zeros_like(Y, dtype=float)
@@ -741,14 +804,12 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
             A_tr, A_te = A[tr], A[te]
             Y_tr, Y_te = Y[tr], Y[te]
 
-            # head predictions (fold-specific split of data, heads are pre-trained)
             s_tr, t_obs_tr, t1_tr, t0_tr = self._head_features(U[tr], A_tr)
             s_te, t_obs_te, t1_te, t0_te = self._head_features(U[te], A_te)
 
             tx_tr, tw_tr, tz_tr, tn_tr = self._split_latent(U[tr])
             tx_te, tw_te, tz_te, tn_te = self._split_latent(U[te])
 
-            # Propensity model on [s_logits, tx, tz, (tn)]
             s_tr_clipped = np.clip(s_tr, -10, 10)
             s_te_clipped = np.clip(s_te, -10, 10)
             prop_feats_tr = [s_tr_clipped.reshape(-1, 1), tx_tr, tz_tr]
@@ -763,18 +824,25 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
                 Xp_tr = scaler_prop.transform(Xp_tr)
                 Xp_te = scaler_prop.transform(Xp_te)
             if np.unique(A_tr).size < 2:
-                e_hat = np.full_like(A_te, float(np.mean(A_tr)) if len(A_tr) else 0.5, dtype=float)
+                e_raw = np.full_like(A_te, float(np.mean(A_tr)) if len(A_tr) else 0.5, dtype=float)
             else:
                 prop = LogisticRegression(max_iter=2000, solver="lbfgs")
                 prop.fit(Xp_tr, A_tr)
-                e_hat = prop.predict_proba(Xp_te)[:, 1]
-            e_hat = np.clip(e_hat, clip, 1 - clip)
+                e_raw = prop.predict_proba(Xp_te)[:, 1]
+
+            qs = _quantiles(e_raw)
+            clip_use = clip
+            cap_use = ipw_cap
+            e_hat = np.clip(e_raw, clip_use, 1 - clip_use)
+
+            stats["clip_used"].append(float(clip_use))
+            stats["cap_used"].append(float(cap_use) if cap_use is not None else np.nan)
+            stats["overlap_score"].append(float(0.0))
+            stats["frac_e_clipped"].append(float(np.mean((e_raw < clip_use) | (e_raw > 1 - clip_use))))
+            for k, v in qs.items():
+                stats[f"e_{k}"].append(v)
 
             def _outcome_features(a_vec, tx_block, tw_block, t_val, tn_block):
-                """Construct outcome design matrix with treatment interactions.
-
-                Columns: [A, tx, tw, t_val, A*t_val, A*tx, A*tw, (tn), (A*tn)]
-                """
                 feats = [
                     a_vec.reshape(-1, 1),
                     tx_block,
@@ -803,13 +871,8 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
                 out_model = Ridge(alpha=cfg.ridge_alpha)
                 out_model.fit(Xo_tr, Y_tr)
 
-            # counterfactual features using head counterfactual predictions
-            X1 = _outcome_features(
-                np.ones_like(A_te), tx_te, tw_te, t1_te, tn_te
-            )
-            X0 = _outcome_features(
-                np.zeros_like(A_te), tx_te, tw_te, t0_te, tn_te
-            )
+            X1 = _outcome_features(np.ones_like(A_te), tx_te, tw_te, t1_te, tn_te)
+            X0 = _outcome_features(np.zeros_like(A_te), tx_te, tw_te, t0_te, tn_te)
             if cfg.standardize_nuisance:
                 X1 = scaler_out.transform(X1)
                 X0 = scaler_out.transform(X0)
@@ -819,10 +882,19 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
             m0 = out_model.predict(X0)
 
             w = (A_te - e_hat) / (e_hat * (1 - e_hat))
+            stats["ipw_abs_max_raw"].append(float(np.max(np.abs(w))) if w.size else np.nan)
             if ipw_cap and ipw_cap > 0:
                 w = np.clip(w, -float(ipw_cap), float(ipw_cap))
+            stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w))) if w.size else np.nan)
+            stats["frac_ipw_capped"].append(float(np.mean(np.abs(w) > float(ipw_cap))) if w.size else np.nan)
 
             psi[te] = m1 - m0 + w * (Y_te - m_hat)
+
+        if not hasattr(self, "training_diagnostics"):
+            self.training_diagnostics = {}
+        if stats:
+            agg = {k: float(np.nanmean(v)) for k, v in stats.items() if v}
+            self.training_diagnostics.update({f"radr_{k}": v for k, v in agg.items()})
 
         return float(np.mean(psi))
 
