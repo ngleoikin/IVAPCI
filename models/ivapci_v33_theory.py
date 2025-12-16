@@ -710,6 +710,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 stats["frac_ipw_capped"].append(
                     float(np.mean(np.abs(w_raw) >= float(cfg.ipw_cap))) if w_raw.size else np.nan
                 )
+            else:
+                stats["ipw_abs_max_capped"].append(np.nan)
+                stats["frac_ipw_capped"].append(np.nan)
 
             psi[te] = m1 - m0 + w * (Y_te - m_hat)
         if stats and hasattr(self, "training_diagnostics"):
@@ -904,9 +907,10 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
             w_raw = (A_te - e_safe) / (e_safe * (1 - e_safe))
 
             stats["ipw_abs_max_raw"].append(float(np.max(np.abs(w_raw))) if w_raw.size else np.nan)
-            stats["ipw_abs_max_raw_unclipped"].append(float(np.max(np.abs(w_raw))) if w_raw.size else np.nan)
-
+            # post-clip (propensity) but pre-cap weights
             w = (A_te - e_hat) / (e_hat * (1 - e_hat))
+            stats["ipw_abs_max_raw_unclipped"].append(float(np.max(np.abs(w))) if w.size else np.nan)
+
             w_capped = np.clip(w, -float(ipw_cap), float(ipw_cap)) if ipw_cap and ipw_cap > 0 else w
             stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w_capped))) if w_capped.size else np.nan)
             if ipw_cap and ipw_cap > 0:
