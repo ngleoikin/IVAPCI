@@ -578,10 +578,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         )
         self.training_diagnostics["min_std"] = float(cfg.min_std)
 
-        # Adversary diagnostics (aligned with training standardization)
+        # Adversary diagnostics (use raw-scale targets for comparability)
         V_std = _apply_standardize(V_all.astype(np.float32), self._v_mean, self._v_std)
         V_t = torch.from_numpy(V_std).to(self.device)
-        Y_std = (Y - float(self._y_mean)) / float(self._y_std + 1e-8)
 
         self.enc_x.eval(); self.enc_w.eval(); self.enc_z.eval(); self.enc_n.eval()
         self.adv_w.eval(); self.adv_n.eval(); self.adv_z.eval()
@@ -593,9 +592,15 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
 
         adv_w_acc = float(((adv_w_probs > 0.5) == (A == 1)).mean()) if adv_w_probs.size else np.nan
         adv_n_acc = float(((adv_n_probs > 0.5) == (A == 1)).mean()) if adv_n_probs.size else np.nan
-        adv_z_r2 = (
-            float(r2_score(Y_std, adv_z_pred)) if np.var(Y_std) > 0 else np.nan
-        )
+
+        # adv_z is trained on standardized Y; convert back to raw scale for diagnostics
+        if hasattr(self, "_y_std") and hasattr(self, "_y_mean"):
+            y_scale = float(self._y_std.squeeze())
+            y_mean = float(self._y_mean.squeeze())
+            adv_z_pred_raw = adv_z_pred * y_scale + y_mean
+        else:
+            adv_z_pred_raw = adv_z_pred
+        adv_z_r2 = float(r2_score(Y, adv_z_pred_raw)) if np.var(Y) > 0 else np.nan
 
         self.training_diagnostics.update(
             {
@@ -690,12 +695,20 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             m0 = m0_model.predict(U_te_s)
             m_hat = np.where(A_te == 1, m1, m0)
 
+            eps_raw = 1e-6
+            w_raw = (A_te - np.clip(e_raw, eps_raw, 1 - eps_raw)) / (
+                np.clip(e_raw, eps_raw, 1 - eps_raw)
+                * (1 - np.clip(e_raw, eps_raw, 1 - eps_raw))
+            )
+            stats["ipw_abs_max_raw"].append(float(np.max(np.abs(w_raw))) if w_raw.size else np.nan)
+
             w = (A_te - e_hat) / (e_hat * (1 - e_hat))
-            stats["ipw_abs_max_raw"].append(float(np.max(np.abs(w))) if w.size else np.nan)
             if cfg.ipw_cap and cfg.ipw_cap > 0:
                 w = np.clip(w, -float(cfg.ipw_cap), float(cfg.ipw_cap))
                 stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w))) if w.size else np.nan)
-                stats["frac_ipw_capped"].append(float(np.mean(np.abs(w) >= float(cfg.ipw_cap))) if w.size else np.nan)
+                stats["frac_ipw_capped"].append(
+                    float(np.mean(np.abs(w_raw) >= float(cfg.ipw_cap))) if w_raw.size else np.nan
+                )
 
             psi[te] = m1 - m0 + w * (Y_te - m_hat)
         if stats and hasattr(self, "training_diagnostics"):
@@ -780,6 +793,8 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
                 "ipw_abs_max_raw",
                 "ipw_abs_max_capped",
                 "frac_ipw_capped",
+                "ipw_abs_max_raw_unclipped",
+                "frac_ipw_capped_raw",
             ]
         }
 
@@ -883,13 +898,28 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
             m1 = out_model.predict(X1)
             m0 = out_model.predict(X0)
 
-            w_raw = (A_te - e_hat) / (e_hat * (1 - e_hat))
-            stats["ipw_abs_max_raw"].append(float(np.max(np.abs(w_raw))) if w_raw.size else np.nan)
-            w = np.clip(w_raw, -float(ipw_cap), float(ipw_cap)) if ipw_cap and ipw_cap > 0 else w_raw
-            stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w))) if w.size else np.nan)
-            stats["frac_ipw_capped"].append(float(np.mean(np.abs(w_raw) > float(ipw_cap))) if w_raw.size else np.nan)
+            eps_raw = 1e-6
+            e_safe = np.clip(e_raw, eps_raw, 1 - eps_raw)
+            w_raw = (A_te - e_safe) / (e_safe * (1 - e_safe))
 
-            psi[te] = m1 - m0 + w * (Y_te - m_hat)
+            stats["ipw_abs_max_raw"].append(float(np.max(np.abs(w_raw))) if w_raw.size else np.nan)
+            stats["ipw_abs_max_raw_unclipped"].append(float(np.max(np.abs(w_raw))) if w_raw.size else np.nan)
+
+            w = (A_te - e_hat) / (e_hat * (1 - e_hat))
+            w_capped = np.clip(w, -float(ipw_cap), float(ipw_cap)) if ipw_cap and ipw_cap > 0 else w
+            stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w_capped))) if w_capped.size else np.nan)
+            if ipw_cap and ipw_cap > 0:
+                stats["frac_ipw_capped"].append(
+                    float(np.mean(np.abs(w_raw) >= float(ipw_cap))) if w_raw.size else np.nan
+                )
+                stats["frac_ipw_capped_raw"].append(
+                    float(np.mean(np.abs(w_raw) >= float(ipw_cap))) if w_raw.size else np.nan
+                )
+            else:
+                stats["frac_ipw_capped"].append(np.nan)
+                stats["frac_ipw_capped_raw"].append(np.nan)
+
+            psi[te] = m1 - m0 + w_capped * (Y_te - m_hat)
 
         if not hasattr(self, "training_diagnostics"):
             self.training_diagnostics = {}
