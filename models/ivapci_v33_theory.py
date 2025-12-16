@@ -706,6 +706,10 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             if cfg.ipw_cap and cfg.ipw_cap > 0:
                 w = np.clip(w, -float(cfg.ipw_cap), float(cfg.ipw_cap))
                 stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w))) if w.size else np.nan)
+<<<<<<< codex/document-pacd-benchmark-design-requirements-q4khfq
+                # use absolute raw weights to count how many observations needed clipping
+=======
+>>>>>>> main
                 stats["frac_ipw_capped"].append(
                     float(np.mean(np.abs(w_raw) >= float(cfg.ipw_cap))) if w_raw.size else np.nan
                 )
