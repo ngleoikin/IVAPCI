@@ -27,10 +27,10 @@ from sklearn.feature_selection import mutual_info_classif, mutual_info_regressio
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
 from sklearn.metrics import r2_score, roc_auc_score
 
-The functions are written to be *robust* to estimator implementations:
-- If the estimator already exposes `training_diagnostics` (dict), we reuse it.
-- If the estimator has `_post_fit_quality_diagnostics(...)`, we can invoke it.
-- Otherwise we fall back to simple correlation-based checks.
+#The functions are written to be *robust* to estimator implementations:
+#- If the estimator already exposes `training_diagnostics` (dict), we reuse it.
+#- If the estimator has `_post_fit_quality_diagnostics(...)`, we can invoke it.
+#- Otherwise we fall back to simple correlation-based checks.
 
 @dataclass
 class TheoremDiagnosticsConfig:
@@ -237,6 +237,8 @@ class TheoremComplianceDiagnostics:
         idx = np.arange(n)
         if n > self.cfg.max_n_for_mi:
             idx = rng.choice(n, size=self.cfg.max_n_for_mi, replace=False)
+        # subsample slice (guard against NameError)
+        U_sub, A_sub, Y_sub = U_c[idx], A[idx], Y[idx]
 
         mi_ua = self._mi_u_target(U_sub, A_sub)
 
