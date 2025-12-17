@@ -15,8 +15,12 @@ Design goals:
     * enc_x/enc_w/enc_z/enc_n (torch modules), optional
 - Robust to edge cases: constant targets, tiny groups, zero-variance columns, NaNs
 - Avoids "training-set accuracy" pitfalls: uses a holdout split by default
-- The functions are written to be *robust* to estimator implementations and optional attributes.
 """
+
+# The functions are written to be *robust* to estimator implementations:
+# - If the estimator already exposes `training_diagnostics` (dict), we reuse it.
+# - If the estimator has `_post_fit_quality_diagnostics(...)`, we can invoke it.
+# - Otherwise we fall back to simple correlation-based checks.
 
 from __future__ import annotations
 
@@ -232,25 +236,30 @@ class TheoremComplianceDiagnostics:
         U_c: np.ndarray,
         n_features: int = 5,
     ) -> Dict[str, Any]:
-        """Proxy for representation information loss via linear recon MSE."""
+        """Proxy for representation information loss via linear recon MSE (holdout)."""
         n, d = X_all.shape
         n_features = int(min(d, max(1, n_features)))
         X_sub = X_all[:, :n_features]
 
-        # recon each feature from U_c (linear)
+        tr, te = self._holdout_split(np.zeros(n), n)
+        if te.size == 0:
+            te = tr
+
+        # recon each feature from U_c (linear) using holdout evaluation
         recons = []
         for j in range(X_sub.shape[1]):
-            y = X_sub[:, j]
-            if np.allclose(np.var(y), 0.0):
+            y_tr = X_sub[tr, j]
+            y_te = X_sub[te, j]
+            if np.allclose(np.var(y_tr), 0.0):
                 recons.append(0.0)
                 continue
             reg = Ridge(alpha=1.0)
-            reg.fit(U_c, y)
-            pred = reg.predict(U_c)
-            recons.append(float(np.mean((pred - y) ** 2)))
+            reg.fit(U_c[tr], y_tr)
+            pred = reg.predict(U_c[te])
+            recons.append(float(np.mean((pred - y_te) ** 2)))
 
-        avg_recon_mse = float(np.mean(recons))
-        total_var = float(np.var(X_sub))
+        avg_recon_mse = float(np.mean(recons)) if recons else 0.0
+        total_var = float(np.var(X_sub[te])) if te.size else float(np.var(X_sub))
         info_loss_proxy = avg_recon_mse / (total_var + 1e-8) if total_var > 0 else avg_recon_mse
 
         # add a low-var input alert signal (useful for your low-var-proxy scenario)
@@ -289,14 +298,26 @@ class TheoremComplianceDiagnostics:
         U_sub, A_sub, Y_sub = U_c[idx], A[idx], Y[idx]
 
         # I(U;A): average across dims
-        mi_ua_vec = mutual_info_classif(
-            U_sub,
-            A_sub.astype(int) if len(np.unique(A_sub)) == 2 else A_sub,
-            discrete_features=False,
-            n_neighbors=self.cfg.mi_n_neighbors,
-            random_state=self.cfg.random_state,
-        )
-        mi_ua = float(np.mean(mi_ua_vec)) if np.size(mi_ua_vec) else 0.0
+        if len(np.unique(A_sub)) == 2 and np.all(np.isin(A_sub, [0, 1])):
+            mi_ua_vec = mutual_info_classif(
+                U_sub,
+                A_sub.astype(int),
+                discrete_features=False,
+                n_neighbors=self.cfg.mi_n_neighbors,
+                random_state=self.cfg.random_state,
+            )
+            mi_ua = float(np.mean(mi_ua_vec)) if np.size(mi_ua_vec) else 0.0
+        else:
+            if np.allclose(np.var(A_sub), 0.0):
+                mi_ua = 0.0
+            else:
+                mi_vec = mutual_info_regression(
+                    U_sub,
+                    A_sub,
+                    n_neighbors=self.cfg.mi_n_neighbors,
+                    random_state=self.cfg.random_state,
+                )
+                mi_ua = float(np.mean(mi_vec)) if np.size(mi_vec) else 0.0
 
         # I(U;Y|A): weighted avg MI within A groups (for binary A)
         mi_uy_given_a = 0.0
@@ -319,7 +340,7 @@ class TheoremComplianceDiagnostics:
             if mass > 0:
                 mi_uy_given_a /= mass
         else:
-            # non-binary A: just compute unconditional proxy
+            # non-binary A: fall back to unconditional proxy
             if not np.allclose(np.var(Y_sub), 0.0):
                 mi_vec = mutual_info_regression(
                     U_sub,
