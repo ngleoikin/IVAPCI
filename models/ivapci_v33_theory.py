@@ -10,7 +10,7 @@ import torch.nn as nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
-from sklearn.metrics import r2_score
+from sklearn.metrics import r2_score, roc_auc_score
 from sklearn.model_selection import KFold, train_test_split
 from sklearn.preprocessing import StandardScaler
 
@@ -216,7 +216,7 @@ def _rbf_hsic(x: torch.Tensor, y: torch.Tensor, sigma: Optional[float] = None) -
     sigma_y = torch.sqrt(torch.median(dist2_y) + 1e-6)
     gamma_y = 1.0 / (2 * max(float(sigma_y.item()), 1e-6) ** 2)
     Ky = torch.exp(-gamma_y * torch.cdist(y, y).pow(2))
-    H = torch.eye(n, device=x.device) - 1.0 / n
+    H = torch.eye(n, device=x.device) - torch.ones((n, n), device=x.device) / n
     Kc = H @ Kx @ H
     Lc = H @ Ky @ H
     hsic = torch.trace(Kc @ Lc) / ((n - 1) ** 2)
@@ -385,7 +385,82 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             except np.linalg.LinAlgError:
                 diag["iv_exclusion_abs_corr_resid"] = float("nan")
         self.training_diagnostics.update(diag)
-        self._block_slices: Optional[Tuple[slice, slice, slice]] = None
+
+    def _post_fit_quality_diagnostics(self, V_all: np.ndarray, A: np.ndarray, Y: np.ndarray) -> None:
+        """Quick holdout diagnostics for learned blocks (AUC/R2).
+
+        These are *diagnostics*, not formal identification tests:
+        - AUC(tz -> A): should be reasonably high if tz captures treatment-relevant signal.
+        - AUC(tw -> A): should be near 0.5 if W is disentangled from treatment.
+        - R2([A, tx, tw] -> Y): should be higher than R2([A, tz] -> Y).
+        - R2([A, tz] -> Y): proxy for exclusion leakage (lower is better).
+        """
+        if not hasattr(self, "training_diagnostics"):
+            self.training_diagnostics = {}
+
+        try:
+            V_all = np.asarray(V_all, dtype=np.float32)
+            A = np.asarray(A).reshape(-1)
+            Y = np.asarray(Y).reshape(-1)
+            n = len(A)
+            if n < 20:
+                return
+
+            V_std = _apply_standardize(V_all, self._v_mean, self._v_std)
+            with torch.no_grad():
+                V_t = torch.from_numpy(V_std).to(self.device)
+                tx, tw, tz, _tn = self._encode_blocks(V_t)
+                txn = tx.detach().cpu().numpy()
+                twn = tw.detach().cpu().numpy()
+                tzn = tz.detach().cpu().numpy()
+
+            a_vals = np.unique(A)
+            is_binary01 = bool(a_vals.size == 2 and np.all(np.isin(a_vals, [0, 1])))
+            A01 = A.astype(int) if is_binary01 else None
+            strat = A01 if (A01 is not None and np.min(np.bincount(A01)) >= 2) else None
+            idx = np.arange(n)
+            idx_tr, idx_te = train_test_split(idx, test_size=0.3, random_state=0, stratify=strat)
+
+            def _auc(feat: np.ndarray) -> float:
+                if A01 is None or feat.size == 0:
+                    return float("nan")
+                lr = LogisticRegression(max_iter=1000)
+                lr.fit(feat[idx_tr], A01[idx_tr])
+                p = lr.predict_proba(feat[idx_te])[:, 1]
+                return float(roc_auc_score(A01[idx_te], p))
+
+            def _r2(feat: np.ndarray) -> float:
+                if feat.size == 0 or np.var(Y[idx_te]) == 0:
+                    return float("nan")
+                reg = Ridge(alpha=1.0)
+                reg.fit(feat[idx_tr], Y[idx_tr])
+                pred = reg.predict(feat[idx_te])
+                return float(r2_score(Y[idx_te], pred))
+
+            auc_z_a = _auc(tzn) if tzn.ndim == 2 else _auc(tzn.reshape(-1, 1))
+            auc_w_a = _auc(twn) if twn.ndim == 2 else _auc(twn.reshape(-1, 1))
+
+            feat_xw_a = np.column_stack([A, txn, twn])
+            feat_z_a = np.column_stack([A, tzn])
+
+            r2_xw_a_y = _r2(feat_xw_a)
+            r2_z_a_y = _r2(feat_z_a)
+
+            self.training_diagnostics.update(
+                {
+                    "rep_auc_z_to_a": auc_z_a,
+                    "rep_auc_w_to_a": auc_w_a,
+                    "rep_r2_xw_a_to_y": r2_xw_a_y,
+                    "rep_r2_z_a_to_y": r2_z_a_y,
+                    "rep_exclusion_leakage_r2": float(r2_z_a_y) if np.isfinite(r2_z_a_y) else float("nan"),
+                    "rep_exclusion_leakage_gap": float(r2_z_a_y - r2_xw_a_y)
+                    if (np.isfinite(r2_z_a_y) and np.isfinite(r2_xw_a_y))
+                    else float("nan"),
+                }
+            )
+        except Exception:
+            # Diagnostics should never crash fitting.
+            return
 
     @staticmethod
     def _toggle_requires_grad(modules: Iterable[nn.Module], flag: bool) -> None:
@@ -577,7 +652,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     cond_weight = float(cfg.lambda_cond_ortho * ramp)
                 cond_ortho = torch.zeros((), device=self.device)
                 if cond_weight > 0:
-                    cond_ortho = _conditional_orthogonal_penalty([tw, tz, tn], torch.cat([tx, tz], dim=1))
+                    cond_ortho = _conditional_orthogonal_penalty(
+                        [tw, tn], torch.cat([tx, tz], dim=1)
+                    )
 
                 adv_w_logits = self.adv_w(tw)
                 adv_n_logits = self.adv_n(tn)
@@ -664,12 +741,23 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
 
         self._is_fit = True
 
-        # Diagnostics
-        self.training_diagnostics = self.info_monitor.estimate(self, V_all)
+        # Post-fit quality diagnostics on learned representations (quick holdout)
+        self._post_fit_quality_diagnostics(V_all, A, Y)
+
+        # Diagnostics (keep any diagnostics collected during fit)
+        if not hasattr(self, "training_diagnostics"):
+            self.training_diagnostics = {}
+        self.training_diagnostics.update(self.info_monitor.estimate(self, V_all))
         self.training_diagnostics["protected_features"] = (
             int(np.sum(self._protected_mask)) if self._protected_mask is not None else 0
         )
         self.training_diagnostics["min_std"] = float(cfg.min_std)
+
+        # Post-fit representation diagnostics (predictability/leakage checks)
+        try:
+            self._post_fit_quality_diagnostics(V_all=V_all, A=A, Y=Y)
+        except Exception as e:
+            self.training_diagnostics["post_fit_diag_error"] = f"{type(e).__name__}: {e}"
 
         # Adversary diagnostics (use raw-scale targets for comparability)
         V_std = _apply_standardize(V_all.astype(np.float32), self._v_mean, self._v_std)
