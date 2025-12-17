@@ -54,6 +54,14 @@ def _info_aware_standardize(
     return standardized, mean, std_clamped, protected
 
 
+def _effective_sample_size(weights: np.ndarray) -> float:
+    if weights.size == 0:
+        return float("nan")
+    num = float(np.sum(weights) ** 2)
+    den = float(np.sum(weights**2) + 1e-12)
+    return num / den if den > 0 else float("nan")
+
+
 def _apply_standardize(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     return (x - mean) / std
 
@@ -192,6 +200,29 @@ def _padic_ultrametric_loss(Uc: torch.Tensor, num_triplets: int = 128) -> torch.
     return torch.mean(viol ** 2)
 
 
+def _rbf_hsic(x: torch.Tensor, y: torch.Tensor, sigma: Optional[float] = None) -> torch.Tensor:
+    """Compute a lightweight unbiased HSIC with RBF kernels for independence penalty."""
+    if x.shape[0] < 4 or y.shape[0] < 4:
+        return torch.zeros((), device=x.device)
+    n = x.shape[0]
+    if sigma is None:
+        with torch.no_grad():
+            dist2 = torch.pdist(x, p=2).pow(2)
+            sigma = torch.sqrt(torch.median(dist2) + 1e-6)
+        sigma = float(sigma.item()) if sigma is not None else 1.0
+    gamma = 1.0 / (2 * max(sigma, 1e-6) ** 2)
+    Kx = torch.exp(-gamma * torch.cdist(x, x).pow(2))
+    dist2_y = torch.pdist(y, p=2).pow(2)
+    sigma_y = torch.sqrt(torch.median(dist2_y) + 1e-6)
+    gamma_y = 1.0 / (2 * max(float(sigma_y.item()), 1e-6) ** 2)
+    Ky = torch.exp(-gamma_y * torch.cdist(y, y).pow(2))
+    H = torch.eye(n, device=x.device) - 1.0 / n
+    Kc = H @ Kx @ H
+    Lc = H @ Ky @ H
+    hsic = torch.trace(Kc @ Lc) / ((n - 1) ** 2)
+    return hsic
+
+
 # -------------------------
 # Config (Theorem 4–5 guided)
 # -------------------------
@@ -219,6 +250,10 @@ class IVAPCIV33TheoryConfig:
     y_hidden: Sequence[int] = (128, 64)
     adv_a_hidden: Sequence[int] = (64,)
     adv_y_hidden: Sequence[int] = (64,)
+
+    # optional independence penalty
+    lambda_hsic: float = 0.0
+    hsic_max_samples: int = 256
 
     lambda_recon: float = 1.0
     lambda_a: float = 0.1
@@ -255,6 +290,7 @@ class IVAPCIV33TheoryConfig:
     ipw_cap_high: float = 100.0
     ipw_cap_radr: Optional[float] = None
     adaptive_ipw: bool = True
+    ess_target: float = 0.8
 
     seed: int = 42
     device: str = "cpu"
@@ -310,6 +346,45 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         self._protected_mask: Optional[np.ndarray] = None
         self.training_diagnostics: Dict[str, float] = {}
         self.info_monitor = InformationLossMonitor()
+
+    def _split_raw_blocks(self, V_all: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        cfg = self.config
+        total = cfg.x_dim + cfg.w_dim + cfg.z_dim
+        if total <= 0 or total > V_all.shape[1]:
+            return None
+        x = V_all[:, : cfg.x_dim]
+        w = V_all[:, cfg.x_dim : cfg.x_dim + cfg.w_dim]
+        z = V_all[:, cfg.x_dim + cfg.w_dim : cfg.x_dim + cfg.w_dim + cfg.z_dim]
+        return x, w, z
+
+    def _identifiability_checks(self, V_all: np.ndarray, A: np.ndarray, Y: np.ndarray) -> None:
+        """Lightweight IV relevance/exclusion proxies stored in diagnostics."""
+        blocks = self._split_raw_blocks(V_all)
+        if blocks is None:
+            return
+        X_raw, W_raw, Z_raw = blocks
+        diag: Dict[str, float] = {}
+
+        def _safe_corr(u: np.ndarray, v: np.ndarray) -> float:
+            if u.size == 0 or v.size == 0 or np.std(u) == 0 or np.std(v) == 0:
+                return float("nan")
+            return float(np.corrcoef(u, v)[0, 1])
+
+        # IV relevance: average abs corr between Z cols and A
+        corrs = [_safe_corr(Z_raw[:, j], A) for j in range(Z_raw.shape[1])]
+        diag["iv_relevance_abs_corr"] = float(np.nanmean(np.abs(corrs))) if corrs else float("nan")
+
+        # Exclusion proxy: corr between Z and residual of Y ~ [A, X, W]
+        if X_raw.size and W_raw.size:
+            cov = np.column_stack([np.ones(len(A)), A, X_raw, W_raw])
+            try:
+                coef, *_ = np.linalg.lstsq(cov, Y, rcond=None)
+                resid = Y - cov @ coef
+                ex_corrs = [_safe_corr(Z_raw[:, j], resid) for j in range(Z_raw.shape[1])]
+                diag["iv_exclusion_abs_corr_resid"] = float(np.nanmean(np.abs(ex_corrs)))
+            except np.linalg.LinAlgError:
+                diag["iv_exclusion_abs_corr_resid"] = float("nan")
+        self.training_diagnostics.update(diag)
         self._block_slices: Optional[Tuple[slice, slice, slice]] = None
 
     @staticmethod
@@ -401,6 +476,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             cfg.n_samples_hint = int(n)
             if cfg.adaptive:
                 cfg.apply_theorem45_defaults()
+
+        # Pre-training identifiability checks (lightweight proxies)
+        self._identifiability_checks(V_all, A, Y)
 
         tr_idx, va_idx = train_test_split(
             np.arange(n),
@@ -505,6 +583,20 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 adv_n_logits = self.adv_n(tn)
                 adv_z_pred = self.adv_z(tz)
 
+                hsic_pen = torch.zeros((), device=self.device)
+                if cfg.lambda_hsic > 0:
+                    # subsample for stability
+                    if tx.shape[0] > cfg.hsic_max_samples:
+                        idx = torch.randperm(tx.shape[0], device=self.device)[: cfg.hsic_max_samples]
+                        tx_h, tw_h, tz_h = tx[idx], tw[idx], tz[idx]
+                    else:
+                        tx_h, tw_h, tz_h = tx, tw, tz
+                    hsic_pen = (
+                        _rbf_hsic(tx_h, tw_h)
+                        + _rbf_hsic(tx_h, tz_h)
+                        + _rbf_hsic(tw_h, tz_h)
+                    )
+
                 loss_main = (
                     cfg.lambda_recon * mse(recon, vb)
                     + cfg.lambda_a * bce(logits_a, ab)
@@ -513,6 +605,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     + cfg.lambda_ortho * ortho
                     + cond_weight * cond_ortho
                     + cfg.gamma_padic * _padic_ultrametric_loss(torch.cat([tx, tz], dim=1))
+                    + cfg.lambda_hsic * hsic_pen
                     - cfg.gamma_adv_w * bce(adv_w_logits, ab)
                     - cfg.gamma_adv_n * bce(adv_n_logits, ab)
                     - cfg.gamma_adv_z * mse(adv_z_pred, yb)
@@ -630,8 +723,8 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         Y = np.asarray(Y).reshape(-1)
         stats = {k: [] for k in [
             "e_min", "e_max", "e_q01", "e_q05", "e_q95", "e_q99",
-            "clip_used", "cap_used", "frac_e_clipped",
-            "ipw_abs_max_raw", "ipw_abs_max_capped", "frac_ipw_capped",
+            "clip_used", "cap_used", "frac_e_clipped", "overlap_score", "ess_raw",
+            "ipw_abs_max_raw", "ipw_abs_max_postclip_precap", "ipw_abs_max_capped", "frac_ipw_capped",
         ]}
 
         def _quantiles(x: np.ndarray) -> Dict[str, float]:
@@ -665,7 +758,19 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 prop = LogisticRegression(max_iter=2000, solver="lbfgs")
                 prop.fit(U_tr_s, A_tr)
                 e_raw = prop.predict_proba(U_te_s)[:, 1]
+            # adaptive clip based on ESS
             clip_use = float(cfg.clip_prop)
+            if cfg.adaptive_ipw:
+                eps = 1e-6
+                w_ate_raw = A_te / np.clip(e_raw, eps, 1 - eps) + (1 - A_te) / np.clip(1 - e_raw, eps, 1 - eps)
+                ess_raw = _effective_sample_size(w_ate_raw)
+                ess_ratio = ess_raw / len(A_te) if len(A_te) else np.nan
+                if np.isfinite(ess_ratio) and ess_ratio < cfg.ess_target:
+                    adj = cfg.ess_target - ess_ratio
+                    clip_use = min(cfg.clip_prop_adaptive_max, max(clip_use, clip_use + 0.05 * adj))
+                stats["ess_raw"].append(float(ess_raw) if np.isfinite(ess_raw) else np.nan)
+            else:
+                stats["ess_raw"].append(np.nan)
             cap_use = float(cfg.ipw_cap) if cfg.ipw_cap is not None else np.nan
             e_hat = np.clip(e_raw, clip_use, 1 - clip_use)
 
@@ -675,6 +780,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             stats["clip_used"].append(clip_use)
             stats["cap_used"].append(cap_use)
             stats["frac_e_clipped"].append(float(np.mean((e_raw < clip_use) | (e_raw > 1 - clip_use))))
+            stats["overlap_score"].append(float(np.mean((e_raw > clip_use) & (e_raw < 1 - clip_use))))
 
             # Arm-specific outcome models to accommodate heterogeneous effects
             if np.any(A_tr == 1):
@@ -703,6 +809,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             stats["ipw_abs_max_raw"].append(float(np.max(np.abs(w_raw))) if w_raw.size else np.nan)
 
             w = (A_te - e_hat) / (e_hat * (1 - e_hat))
+            stats["ipw_abs_max_postclip_precap"].append(float(np.max(np.abs(w))) if w.size else np.nan)
             if cfg.ipw_cap and cfg.ipw_cap > 0:
                 w = np.clip(w, -float(cfg.ipw_cap), float(cfg.ipw_cap))
                 stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w))) if w.size else np.nan)
