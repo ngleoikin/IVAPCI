@@ -27,6 +27,10 @@ from sklearn.feature_selection import mutual_info_classif, mutual_info_regressio
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
 from sklearn.metrics import r2_score, roc_auc_score
 
+The functions are written to be *robust* to estimator implementations:
+- If the estimator already exposes `training_diagnostics` (dict), we reuse it.
+- If the estimator has `_post_fit_quality_diagnostics(...)`, we can invoke it.
+- Otherwise we fall back to simple correlation-based checks.
 
 @dataclass
 class TheoremDiagnosticsConfig:
@@ -46,6 +50,8 @@ class TheoremDiagnosticsConfig:
     random_state: int = 42
     min_group_n: int = 30
 
+from typing import Any, Dict, Optional, Tuple
+import math
 
 class TheoremComplianceDiagnostics:
     """Best-effort diagnostics approximating three theory pillars.
@@ -82,8 +88,14 @@ class TheoremComplianceDiagnostics:
         A = np.asarray(A).reshape(-1)
         Y = np.asarray(Y).reshape(-1)
 
-        # causal latent (concatenated blocks)
-        U_c = self.est.get_latent(X_all)
+        if X_all.ndim != 2:
+            raise ValueError("X_all must be 2D array [n, d].")
+        n = X_all.shape[0]
+        if A.shape[0] != n or Y.shape[0] != n:
+            raise ValueError("A and Y must have same length as X_all.")
+
+        # ---------- latent U_c ----------
+        U_c = self._get_latent_safe(X_all)
 
         # standardized proxy blocks (safe + dtype compatible)
         X_std = self._standardize_inputs_safe(X_all)
@@ -230,7 +242,6 @@ class TheoremComplianceDiagnostics:
         idx = np.arange(n)
         if n > self.cfg.max_n_for_mi:
             idx = rng.choice(n, size=self.cfg.max_n_for_mi, replace=False)
-        U_sub, A_sub, Y_sub = U_c[idx], A[idx], Y[idx]
 
         mi_ua = self._mi_u_target(U_sub, A_sub)
 
@@ -276,6 +287,41 @@ class TheoremComplianceDiagnostics:
             - theorem3_avg_cross_block_corr
         """
         out: Dict[str, Any] = {}
+        n = len(A)
+        tr, te = self._holdout_split(A, n)
+
+        # --- W should not predict A (use ROC-AUC; closer to 0.5 is better) ---
+        auc_w = np.nan
+        if len(np.unique(A)) == 2 and np.all(np.isin(A, [0, 1])) and tw.shape[1] > 0:
+            try:
+                clf = LogisticRegression(max_iter=3000, solver="lbfgs")
+                clf.fit(tw[tr], A[tr])
+                p = clf.predict_proba(tw[te])[:, 1]
+                auc_w = float(roc_auc_score(A[te], p))
+            except Exception:
+                auc_w = np.nan
+        gamma_w = float(abs((auc_w if np.isfinite(auc_w) else 0.5) - 0.5) * 2.0)  # 0 is best
+
+        # --- Z should not predict Y (exclusion leakage proxy) ---
+        r2_z = np.nan
+        if tz.shape[1] > 0 and not np.allclose(np.var(Y[te]), 0.0):
+            try:
+                reg = Ridge(alpha=1.0)
+                reg.fit(tz[tr], Y[tr])
+                pred = reg.predict(tz[te])
+                r2_z = float(r2_score(Y[te], pred))
+            except Exception:
+                r2_z = np.nan
+
+        # --- cross-block linear dependence (avg abs corr) ---
+        H = np.hstack([tx, tw, tz]).astype(float)
+        H = H - H.mean(axis=0, keepdims=True)
+        std = H.std(axis=0, keepdims=True)
+        std = np.where(std > 1e-12, std, 1.0)
+        Hn = H / std
+
+        corr = np.corrcoef(Hn.T)
+        corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Tw -> A (AUC preferred to accuracy; robust to imbalance)
         auc_w = 0.5
@@ -330,5 +376,6 @@ class TheoremComplianceDiagnostics:
         )
         return out
 
+    # ---------- practical rep quality (benchmark-friendly names) ----------
 
 __all__ = ["TheoremDiagnosticsConfig", "TheoremComplianceDiagnostics"]
