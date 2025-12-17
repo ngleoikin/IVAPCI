@@ -29,6 +29,10 @@ from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import r2_score, roc_auc_score
 from sklearn.model_selection import StratifiedShuffleSplit, ShuffleSplit
 
+The functions are written to be *robust* to estimator implementations:
+- If the estimator already exposes `training_diagnostics` (dict), we reuse it.
+- If the estimator has `_post_fit_quality_diagnostics(...)`, we can invoke it.
+- Otherwise we fall back to simple correlation-based checks.
 
 @dataclass
 class TheoremDiagnosticsConfig:
@@ -48,9 +52,10 @@ class TheoremDiagnosticsConfig:
     min_group_n: int = 30
     mi_n_neighbors: int = 3
 
+from typing import Any, Dict, Optional, Tuple
+import math
 
-class TheoremComplianceDiagnostics:
-    """Best-effort diagnostics approximating the three theory pillars.
+import numpy as np
 
     Typical usage inside estimator.fit():
         try:
