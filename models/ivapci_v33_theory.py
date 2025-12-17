@@ -771,6 +771,12 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         )
         self.training_diagnostics["min_std"] = float(cfg.min_std)
 
+        # Post-fit representation diagnostics (predictability/leakage checks)
+        try:
+            self._post_fit_quality_diagnostics(V_all=V_all, A=A, Y=Y)
+        except Exception as e:
+            self.training_diagnostics["post_fit_diag_error"] = f"{type(e).__name__}: {e}"
+
         # Adversary diagnostics (use raw-scale targets for comparability)
         V_std = _apply_standardize(V_all.astype(np.float32), self._v_mean, self._v_std)
         V_t = torch.from_numpy(V_std).to(self.device)
