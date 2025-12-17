@@ -1,4 +1,4 @@
-"""Theory-aligned diagnostics for IVAPCI encoders.
+r"""Theory-aligned diagnostics for IVAPCI encoders.
 
 This module is intentionally self-contained so benchmark harnesses can safely do:
     from models.ivapci_theory_diagnostics import TheoremComplianceDiagnostics
