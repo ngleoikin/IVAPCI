@@ -15,6 +15,10 @@ from sklearn.model_selection import KFold, train_test_split
 from sklearn.preprocessing import StandardScaler
 
 from . import BaseCausalEstimator
+from .ivapci_theory_diagnostics import (
+    TheoremComplianceDiagnostics,
+    TheoremDiagnosticsConfig,
+)
 
 
 # -------------------------
@@ -797,6 +801,24 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 "adv_z_r2": adv_z_r2,
             }
         )
+
+        # Theorem-aligned diagnostics (adds theorem1/theorem2/theorem3_* keys)
+        try:
+            tcfg = TheoremDiagnosticsConfig(
+                max_n_for_mi=min(5000, int(V_all.shape[0])),
+                random_state=int(getattr(cfg, "seed", 0) or 0),
+            )
+            tdiag = TheoremComplianceDiagnostics(self, config=tcfg)
+            t_res = tdiag.run_all_diagnostics(
+                X_all=V_all,
+                A=A,
+                Y=Y,
+                n_recon_features=min(5, int(V_all.shape[1])),
+            )
+            self.training_diagnostics.update(t_res)
+        except Exception as e:  # pragma: no cover - diagnostics best-effort
+            self.training_diagnostics["theorem_diag_error"] = str(e)[:200]
+
     # --- latent + DR ---
     def get_latent(self, V_all: np.ndarray) -> np.ndarray:
         if not self._is_fit:
