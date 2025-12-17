@@ -55,7 +55,8 @@ class TheoremDiagnosticsConfig:
 from typing import Any, Dict, Optional, Tuple
 import math
 
-import numpy as np
+class TheoremComplianceDiagnostics:
+    """Best-effort diagnostics approximating the three theory pillars.
 
     Typical usage inside estimator.fit():
         try:
@@ -127,8 +128,19 @@ import numpy as np
         return U_c
 
     def _standardize_inputs_safe(self, X_all: np.ndarray) -> np.ndarray:
-        """Standardize using estimator stats if present; otherwise return centered inputs."""
-        if hasattr(self.est, "_x_mean") and hasattr(self.est, "_x_std"):
+        """Standardize using estimator stats if present; otherwise return centered inputs.
+
+        Priority:
+          1) estimator._v_mean / estimator._v_std (IVAPCI v3.x naming)
+          2) estimator._x_mean / estimator._x_std (older naming)
+          3) fallback: center-only
+        """
+        if hasattr(self.est, "_v_mean") and hasattr(self.est, "_v_std"):
+            mean = np.asarray(self.est._v_mean, dtype=float)
+            std = np.asarray(self.est._v_std, dtype=float)
+            std_safe = np.where(std > 1e-12, std, 1.0)
+            X_std = (X_all - mean) / std_safe
+        elif hasattr(self.est, "_x_mean") and hasattr(self.est, "_x_std"):
             mean = np.asarray(self.est._x_mean, dtype=float)
             std = np.asarray(self.est._x_std, dtype=float)
             std_safe = np.where(std > 1e-12, std, 1.0)
