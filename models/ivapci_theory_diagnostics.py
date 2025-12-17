@@ -171,16 +171,11 @@ class TheoremComplianceDiagnostics:
                 mod.eval()
 
         with torch.no_grad():
-            # Cast inputs to each encoder's parameter dtype to avoid float64/float32 matmul errors
-            dx = self._module_dtype(self.est.enc_x)
-            dw = self._module_dtype(self.est.enc_w)
-            dz = self._module_dtype(self.est.enc_z)
-            dn = self._module_dtype(self.est.enc_n)
-
-            tx = self.est.enc_x(torch.as_tensor(x_part, device=self.device, dtype=dx))
-            tw = self.est.enc_w(torch.as_tensor(w_part, device=self.device, dtype=dw))
-            tz = self.est.enc_z(torch.as_tensor(z_part, device=self.device, dtype=dz))
-            tn = self.est.enc_n(torch.as_tensor(X_std, device=self.device, dtype=dn))
+            # force encoder inputs to float32 to avoid dtype mismatch with float32 weights
+            tx = self.est.enc_x(torch.as_tensor(x_part, device=self.device, dtype=torch.float32))
+            tw = self.est.enc_w(torch.as_tensor(w_part, device=self.device, dtype=torch.float32))
+            tz = self.est.enc_z(torch.as_tensor(z_part, device=self.device, dtype=torch.float32))
+            tn = self.est.enc_n(torch.as_tensor(X_std, device=self.device, dtype=torch.float32))
 
         return tx.detach().cpu().numpy(), tw.detach().cpu().numpy(), tz.detach().cpu().numpy(), tn.detach().cpu().numpy()
 
@@ -312,6 +307,22 @@ class TheoremComplianceDiagnostics:
         except Exception:
             r2_z = 0.0
 
+        # Partial R^2 for Tz after controlling for A, Tx, Tw
+        partial_r2 = 0.0
+        try:
+            base_X = np.hstack([A.reshape(-1, 1), tx, tw])
+            full_X = np.hstack([base_X, tz])
+            base_model = LinearRegression().fit(base_X, Y)
+            full_model = LinearRegression().fit(full_X, Y)
+            base_resid = Y - base_model.predict(base_X)
+            full_resid = Y - full_model.predict(full_X)
+            ssr_base = float(np.sum(base_resid ** 2))
+            ssr_full = float(np.sum(full_resid ** 2))
+            if ssr_base > 0:
+                partial_r2 = max(0.0, 1.0 - ssr_full / ssr_base)
+        except Exception:
+            partial_r2 = 0.0
+
         # Cross-block correlations (average abs corr between blocks)
         def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
             if a.size == 0 or b.size == 0:
@@ -336,6 +347,7 @@ class TheoremComplianceDiagnostics:
                 "theorem3_Tw_vs_A_auc": float(auc_w),
                 "theorem3_Tw_vs_A_gamma": float(gamma_w),
                 "theorem3_Tz_vs_Y_R2_linear": float(r2_z),
+                "theorem3_Tz_vs_Y_partial_R2": float(partial_r2),
                 "theorem3_avg_cross_block_corr": float(avg_cross),
             }
         )
