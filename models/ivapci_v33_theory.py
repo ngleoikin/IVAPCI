@@ -559,11 +559,18 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         # Pre-training identifiability checks (lightweight proxies)
         self._identifiability_checks(V_all, A, Y)
 
+        # stratify only when each class has enough mass for the holdout
+        uniq, counts = np.unique(A, return_counts=True)
+        stratify_arr = None
+        if uniq.size > 1:
+            test_size = max(1, int(round(cfg.val_frac * n)))
+            if test_size >= uniq.size and counts.min() >= 2:
+                stratify_arr = A
         tr_idx, va_idx = train_test_split(
             np.arange(n),
             test_size=cfg.val_frac,
             random_state=cfg.seed,
-            stratify=A if np.unique(A).size > 1 else None,
+            stratify=stratify_arr,
         )
         V_tr, V_va = V_all[tr_idx], V_all[va_idx]
         A_tr, A_va = A[tr_idx], A[va_idx]
