@@ -252,7 +252,7 @@ class IVAPCIV33TheoryConfig:
     adv_y_hidden: Sequence[int] = (64,)
 
     # optional independence penalty
-    lambda_hsic: float = 0.0
+    lambda_hsic: float = 0.01
     hsic_max_samples: int = 256
 
     lambda_recon: float = 1.0
@@ -282,15 +282,15 @@ class IVAPCIV33TheoryConfig:
     early_stopping_patience: int = 15
     early_stopping_min_delta: float = 0.0
 
-    n_splits_dr: int = 2
-    clip_prop: float = 5e-3
+    n_splits_dr: int = 5
+    clip_prop: float = 1e-2
     clip_prop_adaptive_max: float = 1e-2
     clip_prop_radr: float = 1e-2
-    ipw_cap: float = 20.0
+    ipw_cap: float = 10.0
     ipw_cap_high: float = 100.0
     ipw_cap_radr: Optional[float] = None
     adaptive_ipw: bool = True
-    ess_target: float = 0.8
+    ess_target: float = 0.9
 
     seed: int = 42
     device: str = "cpu"
@@ -652,9 +652,14 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     cond_weight = float(cfg.lambda_cond_ortho * ramp)
                 cond_ortho = torch.zeros((), device=self.device)
                 if cond_weight > 0:
-                    cond_ortho = _conditional_orthogonal_penalty(
-                        [tw, tn], torch.cat([tx, tz], dim=1)
+                    # W ⟂ Z | X and noise ⟂ (X,W,Z)
+                    cond_ortho_wz = _conditional_orthogonal_penalty(
+                        [tw, tz], tx, ridge=cfg.ridge_alpha
                     )
+                    cond_ortho_n = _conditional_orthogonal_penalty(
+                        [tn], torch.cat([tx, tw, tz], dim=1), ridge=cfg.ridge_alpha
+                    )
+                    cond_ortho = cond_ortho_wz + cond_ortho_n
 
                 adv_w_logits = self.adv_w(tw)
                 adv_n_logits = self.adv_n(tn)
@@ -665,13 +670,15 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     # subsample for stability
                     if tx.shape[0] > cfg.hsic_max_samples:
                         idx = torch.randperm(tx.shape[0], device=self.device)[: cfg.hsic_max_samples]
-                        tx_h, tw_h, tz_h = tx[idx], tw[idx], tz[idx]
+                        tx_h, tw_h, tz_h, tn_h = tx[idx], tw[idx], tz[idx], tn[idx]
                     else:
-                        tx_h, tw_h, tz_h = tx, tw, tz
+                        tx_h, tw_h, tz_h, tn_h = tx, tw, tz, tn
                     hsic_pen = (
                         _rbf_hsic(tx_h, tw_h)
-                        + _rbf_hsic(tx_h, tz_h)
                         + _rbf_hsic(tw_h, tz_h)
+                        + _rbf_hsic(tx_h, tn_h)
+                        + _rbf_hsic(tw_h, tn_h)
+                        + _rbf_hsic(tz_h, tn_h)
                     )
 
                 loss_main = (
