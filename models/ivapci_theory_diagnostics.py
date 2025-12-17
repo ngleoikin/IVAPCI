@@ -11,10 +11,11 @@ Design goals:
 - No dependency on your training code beyond a fitted estimator that exposes:
     * get_latent(X_all) -> U_c (np.ndarray)
     * config.x_dim, config.w_dim
-    * _x_mean, _x_std (numpy arrays) for standardization
+    * _v_mean/_v_std or _x_mean/_x_std (numpy arrays) for standardization
     * enc_x/enc_w/enc_z/enc_n (torch modules), optional
 - Robust to edge cases: constant targets, tiny groups, zero-variance columns, NaNs
 - Avoids "training-set accuracy" pitfalls: uses a holdout split by default
+- The functions are written to be *robust* to estimator implementations and optional attributes.
 """
 
 from __future__ import annotations
