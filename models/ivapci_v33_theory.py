@@ -45,13 +45,8 @@ def _info_aware_standardize(
     std = train.std(axis=0, keepdims=True)
     protected = (std < min_std).squeeze(0)
 
-    # Use a softer floor for extremely low-variance channels so their signal is
-    # preserved (Theorem-1 guidance for low-var proxies).
-    std_clamped = np.where(
-        std < min_std,
-        np.maximum(std, low_var_min_std),
-        std,
-    )
+    # Preserve true (small) std for low-variance channels; only apply a tiny floor to avoid divide-by-zero.
+    std_clamped = np.where(std < low_var_min_std, np.maximum(std, low_var_min_std), std)
     standardized = (train - mean) / std_clamped
     if clip_value is not None:
         standardized = np.clip(standardized, -clip_value, clip_value)

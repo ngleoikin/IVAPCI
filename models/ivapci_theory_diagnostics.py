@@ -287,41 +287,6 @@ class TheoremComplianceDiagnostics:
             - theorem3_avg_cross_block_corr
         """
         out: Dict[str, Any] = {}
-        n = len(A)
-        tr, te = self._holdout_split(A, n)
-
-        # --- W should not predict A (use ROC-AUC; closer to 0.5 is better) ---
-        auc_w = np.nan
-        if len(np.unique(A)) == 2 and np.all(np.isin(A, [0, 1])) and tw.shape[1] > 0:
-            try:
-                clf = LogisticRegression(max_iter=3000, solver="lbfgs")
-                clf.fit(tw[tr], A[tr])
-                p = clf.predict_proba(tw[te])[:, 1]
-                auc_w = float(roc_auc_score(A[te], p))
-            except Exception:
-                auc_w = np.nan
-        gamma_w = float(abs((auc_w if np.isfinite(auc_w) else 0.5) - 0.5) * 2.0)  # 0 is best
-
-        # --- Z should not predict Y (exclusion leakage proxy) ---
-        r2_z = np.nan
-        if tz.shape[1] > 0 and not np.allclose(np.var(Y[te]), 0.0):
-            try:
-                reg = Ridge(alpha=1.0)
-                reg.fit(tz[tr], Y[tr])
-                pred = reg.predict(tz[te])
-                r2_z = float(r2_score(Y[te], pred))
-            except Exception:
-                r2_z = np.nan
-
-        # --- cross-block linear dependence (avg abs corr) ---
-        H = np.hstack([tx, tw, tz]).astype(float)
-        H = H - H.mean(axis=0, keepdims=True)
-        std = H.std(axis=0, keepdims=True)
-        std = np.where(std > 1e-12, std, 1.0)
-        Hn = H / std
-
-        corr = np.corrcoef(Hn.T)
-        corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Tw -> A (AUC preferred to accuracy; robust to imbalance)
         auc_w = 0.5
