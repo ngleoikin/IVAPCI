@@ -251,19 +251,19 @@ class IVAPCIV33TheoryConfig:
     adv_y_hidden: Sequence[int] = (64,)
 
     # optional independence penalty
-    lambda_hsic: float = 0.01
+    lambda_hsic: float = 0.05
     hsic_max_samples: int = 256
 
     lambda_recon: float = 1.0
     lambda_a: float = 0.1
     lambda_y: float = 0.5
     lambda_ortho: float = 0.01
-    lambda_cond_ortho: float = 1e-3
+    lambda_cond_ortho: float = 2e-3
     lambda_consistency: float = 0.05
     ridge_alpha: float = 1e-2
     standardize_nuisance: bool = True
-    gamma_adv_w: float = 0.1
-    gamma_adv_z: float = 0.1
+    gamma_adv_w: float = 0.3
+    gamma_adv_z: float = 0.2
     gamma_adv_n: float = 0.1
     gamma_padic: float = 1e-3
 
@@ -276,25 +276,25 @@ class IVAPCIV33TheoryConfig:
     lr_adv: float = 1e-3
     batch_size: int = 128
     epochs_pretrain: int = 50
-    epochs_main: int = 150
+    epochs_main: int = 200
     val_frac: float = 0.1
-    early_stopping_patience: int = 15
+    early_stopping_patience: int = 20
     early_stopping_min_delta: float = 0.0
 
     n_splits_dr: int = 5
-    clip_prop: float = 1e-2
-    clip_prop_adaptive_max: float = 1e-2
+    clip_prop: float = 2e-2
+    clip_prop_adaptive_max: float = 2e-2
     clip_prop_radr: float = 1e-2
-    ipw_cap: float = 10.0
+    ipw_cap: float = 15.0
     ipw_cap_high: float = 100.0
     ipw_cap_radr: Optional[float] = None
     adaptive_ipw: bool = True
-    ess_target: float = 0.9
+    ess_target: float = 0.85
 
     seed: int = 42
     device: str = "cpu"
 
-    cond_ortho_warmup_epochs: int = 10
+    cond_ortho_warmup_epochs: int = 5
 
     n_samples_hint: Optional[int] = None
     adaptive: bool = True
