@@ -80,12 +80,15 @@ class IVAPCIv22Analyzer:
                 print(f"    RMSE: {df_m['rmse'].mean():.4f}")
                 print(f"    运行时间: {df_m['mean_runtime'].mean():.2f}秒")
 
-        print("\n【质量评分分布】(0=最差, 4=最好)")
-        qual_dist = self.df_bench["quality_score"].value_counts().sort_index()
-        for score, count in qual_dist.items():
-            pct = count / len(self.df_bench) * 100
-            bar = "█" * int(pct / 2)
-            print(f"  {int(score)}分: {count:3d} ({pct:5.1f}%) {bar}")
+        print("\n【质量评分分布】(0=最差, 4=最好；按方法汇总)")
+        for method, df_m in self.df_bench.groupby("method"):
+            qual_dist = df_m["quality_score"].value_counts().sort_index()
+            bars = []
+            for score, count in qual_dist.items():
+                pct = count / len(df_m) * 100
+                bars.append(f"{int(score)}分:{count:3d}({pct:5.1f}%)")
+            bars_str = " | ".join(bars)
+            print(f"  {method}: {bars_str}")
 
         iv_rel = self._get(self.df_bench, "iv_relevance_abs_corr")
         excl = self._get(self.df_bench, "iv_exclusion_abs_corr_resid")
