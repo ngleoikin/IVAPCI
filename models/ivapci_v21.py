@@ -337,7 +337,6 @@ class IVAPCIv21GLMEstimator(IVAPCIv21Estimator):
             Y_train, Y_test = Y[train_idx], Y[test_idx]
 
             prop_model = LogisticRegression(
-                penalty="l2",
                 C=1.0,
                 solver="lbfgs",
                 max_iter=1000,
