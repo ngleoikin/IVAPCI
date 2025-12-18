@@ -131,6 +131,75 @@ python scripts/analyze_simulation_diagnostics.py --results outputs/diag_small/si
   - `proxy_score` 高但 `resid_score` 高 → 残留未解释结构或不可识别风险；
   - `prox_cond_score` 极高（>1e3）→ 近端方程病态，需正则化或换模型。
 
+### 4.5 一键跑全量小型基准 + 诊断（与用户提到的命令一致）
+
+以下命令与“反馈中提到的跑法”一致，可直接复现 end-to-end 结果（基准 → 诊断 → 可视化），仅把场景名里的拼写/空格纠正为有效参数。请在仓库根目录执行。
+
+```bash
+# 基准 ATE 估计
+python scripts/run_simulation_benchmark.py \
+  --scenarios EASY-linear-weak EASY-linear-strong MODERATE-nonlinear \
+  HARD-nonlinear-strong HARD-nonlinear-extreme HARD-nonlinear-extreme-mixture \
+  HARD-nonlinear-weak-overlap HARD-nonlinear-hetero-tau \
+  HARD-nonlinear-misaligned-proxies HARD-nonlinear-extreme-low-var-proxy \
+  --seeds 0 1 \
+  --n 500 \
+  --methods naive dr_glm dr_rf oracle_U ivapci_v2_1_glm ivapci_v3_1_radr \
+  ivapci_v3_1_radr_theory ivapci_v3_3_hier ivapci_v3_3_hier_radr \
+  --outdir outputs/bench_small
+
+# 诊断（接续上一步输出）
+python scripts/run_diagnostics_on_simulation.py \
+  --scenarios EASY-linear-weak EASY-linear-strong MODERATE-nonlinear \
+  HARD-nonlinear-strong HARD-nonlinear-extreme HARD-nonlinear-extreme-mixture \
+  HARD-nonlinear-weak-overlap HARD-nonlinear-hetero-tau \
+  HARD-nonlinear-misaligned-proxies HARD-nonlinear-extreme-low-var-proxy \
+  --seeds 0 1 \
+  --n 500 \
+  --methods naive dr_glm dr_rf oracle_U ivapci_v2_1_glm ivapci_v3_1_radr \
+  ivapci_v3_1_radr_theory ivapci_v3_3_hier ivapci_v3_3_hier_radr \
+  --outdir outputs/diag_small
+
+# 结果/诊断可视化
+python scripts/analyze_simulation_results.py \
+  --results outputs/bench_small/simulation_benchmark_summary.csv \
+  --outdir outputs/bench_small/plots
+
+python scripts/analyze_simulation_diagnostics.py \
+  --results outputs/diag_small/simulation_diagnostics_results.csv \
+  --outdir outputs/diag_small/plots
+```
+
+> 提示：
+> - `--n` 若设得过小且使用分层抽样，scikit-learn 会报 “The test_size … should be greater or equal to the number of classes”；保持 `n>=200` 或降低 `--val-frac` 即可避免。
+> - 请确保在仓库根目录运行，便于脚本写入 `outputs/...`。
+> - 如需缩短时间，可先只跑 `--scenarios EASY-linear-weak --n 200 --seeds 0` 验证流程。
+
+### 4.6 结果分析脚本（v22 专用快速汇总）
+
+新增脚本 `scripts/ivapci_v33_v22_analyzer.py` 可直接读取 CSV 并打印质量/重叠/对抗器等摘要，使用方式如下（可用默认文件名或显式指定路径）：
+
+```bash
+# 使用默认文件名（当前目录下）
+python scripts/ivapci_v33_v22_analyzer.py
+
+# 指定自定义路径示例
+python scripts/ivapci_v33_v22_analyzer.py \
+  --benchmark-file outputs/bench_small/simulation_benchmark_results.csv \
+  --diagnostics-file outputs/diag_small/simulation_diagnostics_results.csv \
+  --summary-file outputs/bench_small/simulation_benchmark_summary.csv
+```
+
+输出内容概览：
+- EXECUTIVE SUMMARY：MAE/RMSE、运行时间、质量评分分布、弱 IV / 排他性 / 重叠问题计数
+- 可识别性：IV 相关性、排他性统计及其与误差的相关性
+- 表征质量：Z→A、W→A AUC，排他性泄露 R²，[X,W,A]→Y 的 R²
+- 倾向性/重叠：倾向性分布、截断比例、重叠得分、ESS（若有）
+- 权重：截断前/后权重分布、截断比例、上限设置
+- 对抗器：W/N/Z 对抗器指标
+- 场景对比：各场景 RMSE / IV 强度 / 重叠，以及问题场景列表
+- 改进建议：基于弱 IV、截断比例、W 独立性、排他性泄露、权重等给出操作性建议
+
 ## 5. 常见问题
 
 - **安装缓慢或失败**：配置 PyPI 国内镜像或离线源后重试 `pip install -r requirements.txt`。
