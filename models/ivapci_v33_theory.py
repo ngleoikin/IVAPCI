@@ -10,11 +10,15 @@ import torch.nn as nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
-from sklearn.metrics import r2_score
+from sklearn.metrics import r2_score, roc_auc_score
 from sklearn.model_selection import KFold, train_test_split
 from sklearn.preprocessing import StandardScaler
 
 from . import BaseCausalEstimator
+from .ivapci_theory_diagnostics import (
+    TheoremComplianceDiagnostics,
+    TheoremDiagnosticsConfig,
+)
 
 
 # -------------------------
@@ -41,13 +45,8 @@ def _info_aware_standardize(
     std = train.std(axis=0, keepdims=True)
     protected = (std < min_std).squeeze(0)
 
-    # Use a softer floor for extremely low-variance channels so their signal is
-    # preserved (Theorem-1 guidance for low-var proxies).
-    std_clamped = np.where(
-        std < min_std,
-        np.maximum(std, low_var_min_std),
-        std,
-    )
+    # Preserve true (small) std for low-variance channels; only apply a tiny floor to avoid divide-by-zero.
+    std_clamped = np.where(std < low_var_min_std, np.maximum(std, low_var_min_std), std)
     standardized = (train - mean) / std_clamped
     if clip_value is not None:
         standardized = np.clip(standardized, -clip_value, clip_value)
@@ -216,7 +215,7 @@ def _rbf_hsic(x: torch.Tensor, y: torch.Tensor, sigma: Optional[float] = None) -
     sigma_y = torch.sqrt(torch.median(dist2_y) + 1e-6)
     gamma_y = 1.0 / (2 * max(float(sigma_y.item()), 1e-6) ** 2)
     Ky = torch.exp(-gamma_y * torch.cdist(y, y).pow(2))
-    H = torch.eye(n, device=x.device) - 1.0 / n
+    H = torch.eye(n, device=x.device) - torch.ones((n, n), device=x.device) / n
     Kc = H @ Kx @ H
     Lc = H @ Ky @ H
     hsic = torch.trace(Kc @ Lc) / ((n - 1) ** 2)
@@ -252,19 +251,19 @@ class IVAPCIV33TheoryConfig:
     adv_y_hidden: Sequence[int] = (64,)
 
     # optional independence penalty
-    lambda_hsic: float = 0.0
+    lambda_hsic: float = 0.05
     hsic_max_samples: int = 256
 
     lambda_recon: float = 1.0
     lambda_a: float = 0.1
     lambda_y: float = 0.5
     lambda_ortho: float = 0.01
-    lambda_cond_ortho: float = 1e-3
+    lambda_cond_ortho: float = 2e-3
     lambda_consistency: float = 0.05
     ridge_alpha: float = 1e-2
     standardize_nuisance: bool = True
-    gamma_adv_w: float = 0.1
-    gamma_adv_z: float = 0.1
+    gamma_adv_w: float = 0.3
+    gamma_adv_z: float = 0.2
     gamma_adv_n: float = 0.1
     gamma_padic: float = 1e-3
 
@@ -277,25 +276,25 @@ class IVAPCIV33TheoryConfig:
     lr_adv: float = 1e-3
     batch_size: int = 128
     epochs_pretrain: int = 50
-    epochs_main: int = 150
+    epochs_main: int = 200
     val_frac: float = 0.1
-    early_stopping_patience: int = 15
+    early_stopping_patience: int = 20
     early_stopping_min_delta: float = 0.0
 
-    n_splits_dr: int = 2
-    clip_prop: float = 5e-3
-    clip_prop_adaptive_max: float = 1e-2
+    n_splits_dr: int = 5
+    clip_prop: float = 2e-2
+    clip_prop_adaptive_max: float = 2e-2
     clip_prop_radr: float = 1e-2
-    ipw_cap: float = 20.0
+    ipw_cap: float = 15.0
     ipw_cap_high: float = 100.0
     ipw_cap_radr: Optional[float] = None
     adaptive_ipw: bool = True
-    ess_target: float = 0.8
+    ess_target: float = 0.85
 
     seed: int = 42
     device: str = "cpu"
 
-    cond_ortho_warmup_epochs: int = 10
+    cond_ortho_warmup_epochs: int = 5
 
     n_samples_hint: Optional[int] = None
     adaptive: bool = True
@@ -385,7 +384,82 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             except np.linalg.LinAlgError:
                 diag["iv_exclusion_abs_corr_resid"] = float("nan")
         self.training_diagnostics.update(diag)
-        self._block_slices: Optional[Tuple[slice, slice, slice]] = None
+
+    def _post_fit_quality_diagnostics(self, V_all: np.ndarray, A: np.ndarray, Y: np.ndarray) -> None:
+        """Quick holdout diagnostics for learned blocks (AUC/R2).
+
+        These are *diagnostics*, not formal identification tests:
+        - AUC(tz -> A): should be reasonably high if tz captures treatment-relevant signal.
+        - AUC(tw -> A): should be near 0.5 if W is disentangled from treatment.
+        - R2([A, tx, tw] -> Y): should be higher than R2([A, tz] -> Y).
+        - R2([A, tz] -> Y): proxy for exclusion leakage (lower is better).
+        """
+        if not hasattr(self, "training_diagnostics"):
+            self.training_diagnostics = {}
+
+        try:
+            V_all = np.asarray(V_all, dtype=np.float32)
+            A = np.asarray(A).reshape(-1)
+            Y = np.asarray(Y).reshape(-1)
+            n = len(A)
+            if n < 20:
+                return
+
+            V_std = _apply_standardize(V_all, self._v_mean, self._v_std)
+            with torch.no_grad():
+                V_t = torch.from_numpy(V_std).to(self.device)
+                tx, tw, tz, _tn = self._encode_blocks(V_t)
+                txn = tx.detach().cpu().numpy()
+                twn = tw.detach().cpu().numpy()
+                tzn = tz.detach().cpu().numpy()
+
+            a_vals = np.unique(A)
+            is_binary01 = bool(a_vals.size == 2 and np.all(np.isin(a_vals, [0, 1])))
+            A01 = A.astype(int) if is_binary01 else None
+            strat = A01 if (A01 is not None and np.min(np.bincount(A01)) >= 2) else None
+            idx = np.arange(n)
+            idx_tr, idx_te = train_test_split(idx, test_size=0.3, random_state=0, stratify=strat)
+
+            def _auc(feat: np.ndarray) -> float:
+                if A01 is None or feat.size == 0:
+                    return float("nan")
+                lr = LogisticRegression(max_iter=1000)
+                lr.fit(feat[idx_tr], A01[idx_tr])
+                p = lr.predict_proba(feat[idx_te])[:, 1]
+                return float(roc_auc_score(A01[idx_te], p))
+
+            def _r2(feat: np.ndarray) -> float:
+                if feat.size == 0 or np.var(Y[idx_te]) == 0:
+                    return float("nan")
+                reg = Ridge(alpha=1.0)
+                reg.fit(feat[idx_tr], Y[idx_tr])
+                pred = reg.predict(feat[idx_te])
+                return float(r2_score(Y[idx_te], pred))
+
+            auc_z_a = _auc(tzn) if tzn.ndim == 2 else _auc(tzn.reshape(-1, 1))
+            auc_w_a = _auc(twn) if twn.ndim == 2 else _auc(twn.reshape(-1, 1))
+
+            feat_xw_a = np.column_stack([A, txn, twn])
+            feat_z_a = np.column_stack([A, tzn])
+
+            r2_xw_a_y = _r2(feat_xw_a)
+            r2_z_a_y = _r2(feat_z_a)
+
+            self.training_diagnostics.update(
+                {
+                    "rep_auc_z_to_a": auc_z_a,
+                    "rep_auc_w_to_a": auc_w_a,
+                    "rep_r2_xw_a_to_y": r2_xw_a_y,
+                    "rep_r2_z_a_to_y": r2_z_a_y,
+                    "rep_exclusion_leakage_r2": float(r2_z_a_y) if np.isfinite(r2_z_a_y) else float("nan"),
+                    "rep_exclusion_leakage_gap": float(r2_z_a_y - r2_xw_a_y)
+                    if (np.isfinite(r2_z_a_y) and np.isfinite(r2_xw_a_y))
+                    else float("nan"),
+                }
+            )
+        except Exception:
+            # Diagnostics should never crash fitting.
+            return
 
     @staticmethod
     def _toggle_requires_grad(modules: Iterable[nn.Module], flag: bool) -> None:
@@ -480,11 +554,18 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         # Pre-training identifiability checks (lightweight proxies)
         self._identifiability_checks(V_all, A, Y)
 
+        # stratify only when each class has enough mass for the holdout
+        uniq, counts = np.unique(A, return_counts=True)
+        stratify_arr = None
+        if uniq.size > 1:
+            test_size = max(1, int(round(cfg.val_frac * n)))
+            if test_size >= uniq.size and counts.min() >= 2:
+                stratify_arr = A
         tr_idx, va_idx = train_test_split(
             np.arange(n),
             test_size=cfg.val_frac,
             random_state=cfg.seed,
-            stratify=A if np.unique(A).size > 1 else None,
+            stratify=stratify_arr,
         )
         V_tr, V_va = V_all[tr_idx], V_all[va_idx]
         A_tr, A_va = A[tr_idx], A[va_idx]
@@ -577,7 +658,14 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     cond_weight = float(cfg.lambda_cond_ortho * ramp)
                 cond_ortho = torch.zeros((), device=self.device)
                 if cond_weight > 0:
-                    cond_ortho = _conditional_orthogonal_penalty([tw, tz, tn], torch.cat([tx, tz], dim=1))
+                    # W ⟂ Z | X and noise ⟂ (X,W,Z)
+                    cond_ortho_wz = _conditional_orthogonal_penalty(
+                        [tw, tz], tx, ridge=cfg.ridge_alpha
+                    )
+                    cond_ortho_n = _conditional_orthogonal_penalty(
+                        [tn], torch.cat([tx, tw, tz], dim=1), ridge=cfg.ridge_alpha
+                    )
+                    cond_ortho = cond_ortho_wz + cond_ortho_n
 
                 adv_w_logits = self.adv_w(tw)
                 adv_n_logits = self.adv_n(tn)
@@ -588,13 +676,15 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     # subsample for stability
                     if tx.shape[0] > cfg.hsic_max_samples:
                         idx = torch.randperm(tx.shape[0], device=self.device)[: cfg.hsic_max_samples]
-                        tx_h, tw_h, tz_h = tx[idx], tw[idx], tz[idx]
+                        tx_h, tw_h, tz_h, tn_h = tx[idx], tw[idx], tz[idx], tn[idx]
                     else:
-                        tx_h, tw_h, tz_h = tx, tw, tz
+                        tx_h, tw_h, tz_h, tn_h = tx, tw, tz, tn
                     hsic_pen = (
                         _rbf_hsic(tx_h, tw_h)
-                        + _rbf_hsic(tx_h, tz_h)
                         + _rbf_hsic(tw_h, tz_h)
+                        + _rbf_hsic(tx_h, tn_h)
+                        + _rbf_hsic(tw_h, tn_h)
+                        + _rbf_hsic(tz_h, tn_h)
                     )
 
                 loss_main = (
@@ -664,8 +754,13 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
 
         self._is_fit = True
 
-        # Diagnostics
-        self.training_diagnostics = self.info_monitor.estimate(self, V_all)
+        # Post-fit quality diagnostics on learned representations (quick holdout)
+        self._post_fit_quality_diagnostics(V_all, A, Y)
+
+        # Diagnostics (keep any diagnostics collected during fit)
+        if not hasattr(self, "training_diagnostics"):
+            self.training_diagnostics = {}
+        self.training_diagnostics.update(self.info_monitor.estimate(self, V_all))
         self.training_diagnostics["protected_features"] = (
             int(np.sum(self._protected_mask)) if self._protected_mask is not None else 0
         )
@@ -702,6 +797,24 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 "adv_z_r2": adv_z_r2,
             }
         )
+
+        # Theorem-aligned diagnostics (adds theorem1/theorem2/theorem3_* keys)
+        try:
+            tcfg = TheoremDiagnosticsConfig(
+                max_n_for_mi=min(5000, int(V_all.shape[0])),
+                random_state=int(getattr(cfg, "seed", 0) or 0),
+            )
+            tdiag = TheoremComplianceDiagnostics(self, config=tcfg)
+            t_res = tdiag.run_all_diagnostics(
+                X_all=V_all,
+                A=A,
+                Y=Y,
+                n_recon_features=min(5, int(V_all.shape[1])),
+            )
+            self.training_diagnostics.update(t_res)
+        except Exception as e:  # pragma: no cover - diagnostics best-effort
+            self.training_diagnostics["theorem_diag_error"] = str(e)[:200]
+
     # --- latent + DR ---
     def get_latent(self, V_all: np.ndarray) -> np.ndarray:
         if not self._is_fit:
