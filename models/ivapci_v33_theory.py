@@ -41,16 +41,17 @@ def _info_aware_standardize(
     Returns:
         train_std, mean, std_clamped, protected_mask
     """
-    mean = train.mean(axis=0, keepdims=True)
-    std = train.std(axis=0, keepdims=True)
+    train = np.asarray(train, dtype=np.float32)
+    mean = train.mean(axis=0, keepdims=True, dtype=np.float32)
+    std = train.std(axis=0, keepdims=True, dtype=np.float32)
     protected = (std < min_std).squeeze(0)
 
     # Preserve true (small) std for low-variance channels; only apply a tiny floor to avoid divide-by-zero.
-    std_clamped = np.where(std < low_var_min_std, np.maximum(std, low_var_min_std), std)
-    standardized = (train - mean) / std_clamped
+    std_clamped = np.where(std < low_var_min_std, np.maximum(std, low_var_min_std), std).astype(np.float32)
+    standardized = ((train - mean) / std_clamped).astype(np.float32)
     if clip_value is not None:
-        standardized = np.clip(standardized, -clip_value, clip_value)
-    return standardized, mean, std_clamped, protected
+        standardized = np.clip(standardized, -clip_value, clip_value).astype(np.float32)
+    return standardized, mean.astype(np.float32), std_clamped, protected
 
 
 def _effective_sample_size(weights: np.ndarray) -> float:
@@ -62,7 +63,10 @@ def _effective_sample_size(weights: np.ndarray) -> float:
 
 
 def _apply_standardize(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    return (x - mean) / std
+    x_f = np.asarray(x, dtype=np.float32)
+    mean_f = np.asarray(mean, dtype=np.float32)
+    std_f = np.asarray(std, dtype=np.float32)
+    return (x_f - mean_f) / std_f
 
 
 class InformationLossMonitor:
@@ -594,6 +598,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
     def _encode_blocks(
         self, V_t: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        target_dtype = next(self.enc_x.parameters()).dtype
+        if V_t.dtype != target_dtype:
+            V_t = V_t.to(dtype=target_dtype)
         x_part, w_part, z_part = self._split_blocks_tensor(V_t)
         tx = self.enc_x(x_part)
         tw = self.enc_w(w_part)
@@ -656,6 +663,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         Y_va_std = _apply_standardize(Y_va.reshape(-1, 1), self._y_mean, self._y_std).squeeze(1)
 
         self._build(d_all)
+        target_dtype = next(self.enc_x.parameters()).dtype
 
         bce = nn.BCEWithLogitsLoss()
         mse = nn.MSELoss()
@@ -699,7 +707,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             epoch_loss = 0.0
             epoch_batches = 0
             for vb, ab, yb in tr_loader:
-                vb = vb.to(self.device); ab = ab.to(self.device); yb = yb.to(self.device)
+                vb = vb.to(self.device, dtype=target_dtype)
+                ab = ab.to(self.device, dtype=target_dtype)
+                yb = yb.to(self.device, dtype=target_dtype)
 
                 # adversaries update
                 with torch.no_grad():
@@ -780,7 +790,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             vals = []
             with torch.no_grad():
                 for vb, ab, yb in va_loader:
-                    vb = vb.to(self.device); ab = ab.to(self.device); yb = yb.to(self.device)
+                    vb = vb.to(self.device, dtype=target_dtype)
+                    ab = ab.to(self.device, dtype=target_dtype)
+                    yb = yb.to(self.device, dtype=target_dtype)
                     tx, tw, tz, tn = self._encode_blocks(vb)
                     recon = self.decoder(torch.cat([tx, tw, tz, tn], dim=1))
                     logits_a = self.a_head(torch.cat([tx, tz], dim=1))
