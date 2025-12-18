@@ -27,6 +27,10 @@ from sklearn.feature_selection import mutual_info_classif, mutual_info_regressio
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
 from sklearn.metrics import r2_score, roc_auc_score
 
+#The functions are written to be *robust* to estimator implementations:
+#- If the estimator already exposes `training_diagnostics` (dict), we reuse it.
+#- If the estimator has `_post_fit_quality_diagnostics(...)`, we can invoke it.
+#- Otherwise we fall back to simple correlation-based checks.
 
 @dataclass
 class TheoremDiagnosticsConfig:
@@ -46,6 +50,8 @@ class TheoremDiagnosticsConfig:
     random_state: int = 42
     min_group_n: int = 30
 
+from typing import Any, Dict, Optional, Tuple
+import math
 
 class TheoremComplianceDiagnostics:
     """Best-effort diagnostics approximating three theory pillars.
@@ -82,8 +88,14 @@ class TheoremComplianceDiagnostics:
         A = np.asarray(A).reshape(-1)
         Y = np.asarray(Y).reshape(-1)
 
-        # causal latent (concatenated blocks)
-        U_c = self.est.get_latent(X_all)
+        if X_all.ndim != 2:
+            raise ValueError("X_all must be 2D array [n, d].")
+        n = X_all.shape[0]
+        if A.shape[0] != n or Y.shape[0] != n:
+            raise ValueError("A and Y must have same length as X_all.")
+
+        # ---------- latent U_c ----------
+        U_c = self._get_latent_safe(X_all)
 
         # standardized proxy blocks (safe + dtype compatible)
         X_std = self._standardize_inputs_safe(X_all)
@@ -343,5 +355,6 @@ class TheoremComplianceDiagnostics:
         )
         return out
 
+    # ---------- practical rep quality (benchmark-friendly names) ----------
 
 __all__ = ["TheoremDiagnosticsConfig", "TheoremComplianceDiagnostics"]
