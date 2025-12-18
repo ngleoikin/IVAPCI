@@ -343,6 +343,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         np.random.seed(self.config.seed)
         self._is_fit = False
         self._protected_mask: Optional[np.ndarray] = None
+        self._weak_iv_flag: bool = False
         self.training_diagnostics: Dict[str, float] = {}
         self.info_monitor = InformationLossMonitor()
 
@@ -372,6 +373,30 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         # IV relevance: average abs corr between Z cols and A
         corrs = [_safe_corr(Z_raw[:, j], A) for j in range(Z_raw.shape[1])]
         diag["iv_relevance_abs_corr"] = float(np.nanmean(np.abs(corrs))) if corrs else float("nan")
+
+        # First-stage F-statistic proxy: A ~ [X,W,Z] vs reduced A ~ [X,W]
+        try:
+            XW = np.column_stack([np.ones(len(A)), X_raw, W_raw])
+            XWZ = np.column_stack([np.ones(len(A)), X_raw, W_raw, Z_raw])
+            beta_r, *_ = np.linalg.lstsq(XW, A, rcond=None)
+            beta_f, *_ = np.linalg.lstsq(XWZ, A, rcond=None)
+            resid_r = A - XW @ beta_r
+            resid_f = A - XWZ @ beta_f
+            rss_r = float(np.sum(resid_r**2))
+            rss_f = float(np.sum(resid_f**2))
+            k = Z_raw.shape[1]
+            n = len(A)
+            f_num = (rss_r - rss_f) / max(k, 1)
+            f_den = rss_f / max(n - XWZ.shape[1], 1)
+            f_stat = f_num / (f_den + 1e-12)
+            diag["iv_first_stage_f"] = float(f_stat)
+            if f_stat < 10.0:
+                diag["weak_iv_warning"] = "First-stage F < 10: weak IV detected; using conservative DR."
+                self._weak_iv_flag = True
+        except Exception:
+            diag["iv_first_stage_f"] = float("nan")
+
+        diag["weak_iv_flag"] = bool(getattr(self, "_weak_iv_flag", False))
 
         # Exclusion proxy: corr between Z and residual of Y ~ [A, X, W]
         if X_raw.size and W_raw.size:
@@ -545,6 +570,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         Y = np.asarray(Y, dtype=np.float32).reshape(-1)
         n, d_all = V_all.shape
         cfg = self.config
+
+        # reset weak-IV flag per fit
+        self._weak_iv_flag = False
 
         if cfg.n_samples_hint is None:
             cfg.n_samples_hint = int(n)
@@ -840,6 +868,8 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         U = np.asarray(U)
         A = np.asarray(A).reshape(-1)
         Y = np.asarray(Y).reshape(-1)
+        weak_iv = bool(getattr(self, "_weak_iv_flag", False))
+        dr_mode = "weak_iv_conservative" if weak_iv else "default"
         stats = {k: [] for k in [
             "e_min", "e_max", "e_q01", "e_q05", "e_q95", "e_q99",
             "clip_used", "cap_used", "frac_e_clipped", "overlap_score", "ess_raw",
@@ -891,6 +921,10 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             else:
                 stats["ess_raw"].append(np.nan)
             cap_use = float(cfg.ipw_cap) if cfg.ipw_cap is not None else np.nan
+            if weak_iv:
+                clip_use = max(clip_use, 0.05)
+                if np.isfinite(cap_use):
+                    cap_use = min(cap_use, 10.0)
             e_hat = np.clip(e_raw, clip_use, 1 - clip_use)
 
             qs = _quantiles(e_raw)
@@ -929,12 +963,11 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
 
             w = (A_te - e_hat) / (e_hat * (1 - e_hat))
             stats["ipw_abs_max_postclip_precap"].append(float(np.max(np.abs(w))) if w.size else np.nan)
-            if cfg.ipw_cap and cfg.ipw_cap > 0:
-                w = np.clip(w, -float(cfg.ipw_cap), float(cfg.ipw_cap))
+            if np.isfinite(cap_use) and cap_use > 0:
+                w = np.clip(w, -float(cap_use), float(cap_use))
                 stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w))) if w.size else np.nan)
-                # use absolute raw weights to count how many observations needed clipping
                 stats["frac_ipw_capped"].append(
-                    float(np.mean(np.abs(w_raw) >= float(cfg.ipw_cap))) if w_raw.size else np.nan
+                    float(np.mean(np.abs(w_raw) >= float(cap_use))) if w_raw.size else np.nan
                 )
             else:
                 stats["ipw_abs_max_capped"].append(np.nan)
@@ -944,6 +977,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         if stats and hasattr(self, "training_diagnostics"):
             agg = {k: float(np.nanmean(v)) for k, v in stats.items() if v}
             self.training_diagnostics.update({f"dr_{k}": v for k, v in agg.items()})
+            self.training_diagnostics["dr_mode"] = dr_mode
         return float(np.mean(psi))
 
     def estimate_ate(self, V_all: np.ndarray, A: np.ndarray, Y: np.ndarray) -> float:
@@ -1007,6 +1041,8 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
         U = np.asarray(U)
         A = np.asarray(A).reshape(-1)
         Y = np.asarray(Y).reshape(-1)
+        weak_iv = bool(getattr(self, "_weak_iv_flag", False))
+        dr_mode = "weak_iv_conservative" if weak_iv else "default"
         stats: Dict[str, list] = {
             k: []
             for k in [
@@ -1044,6 +1080,10 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
         psi = np.zeros_like(Y, dtype=float)
         clip = float(max(cfg.clip_prop_radr, cfg.clip_prop))
         ipw_cap = cfg.ipw_cap_radr if getattr(cfg, "ipw_cap_radr", None) is not None else cfg.ipw_cap
+        if weak_iv:
+            clip = max(clip, 0.05)
+            if ipw_cap is not None:
+                ipw_cap = min(float(ipw_cap), 10.0)
 
         for tr, te in kf.split(U):
             A_tr, A_te = A[tr], A[te]
@@ -1157,6 +1197,7 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
         if stats:
             agg = {k: float(np.nanmean(v)) for k, v in stats.items() if v}
             self.training_diagnostics.update({f"radr_{k}": v for k, v in agg.items()})
+            self.training_diagnostics["dr_mode"] = dr_mode
 
         return float(np.mean(psi))
 
