@@ -80,6 +80,44 @@ class InformationLossMonitor:
         return {"recon_mse": recon_mse, "info_loss_proxy": recon_mse / var}
 
 
+def enhanced_training_monitor(estimator: "IVAPCIv33TheoryHierEstimator", epoch: int, losses: Dict[str, float]) -> None:
+    """Lightweight training-time monitor to surface identifiability risks.
+
+    Checks every 10 epochs:
+      - W ⟂ A proxy via rep_auc_w_to_a
+      - Z exclusion leakage via rep_exclusion_leakage_r2
+      - IV strength via iv_relevance_abs_corr
+    Optionally increases gamma_adv_w early in training when W–A dependence is high.
+    """
+    if epoch % 10 != 0:
+        return
+
+    diag = getattr(estimator, "training_diagnostics", {}) or {}
+    warnings = []
+
+    w_auc = float(diag.get("rep_auc_w_to_a", 0.5))
+    if abs(w_auc - 0.5) > 0.1:
+        warnings.append(f"⚠️  W 独立性差: AUC={w_auc:.3f}")
+
+    z_r2 = float(diag.get("rep_exclusion_leakage_r2", 0.0))
+    if z_r2 > 0.15:
+        warnings.append(f"⚠️  Z 泄露: R²={z_r2:.3f}")
+
+    iv_strength = float(diag.get("iv_relevance_abs_corr", 0.0))
+    if iv_strength < 0.15:
+        warnings.append(f"⚠️  弱 IV: corr={iv_strength:.3f}")
+
+    if warnings:
+        print(f"\nEpoch {epoch} 诊断 (main={losses.get('main', float('nan')):.4f}, val={losses.get('val', float('nan')):.4f}):")
+        for w in warnings:
+            print(f"  {w}")
+        print()
+
+    if abs(w_auc - 0.5) > 0.15 and epoch < 100:
+        estimator.config.gamma_adv_w *= 1.2
+        print(f"  🔧 自动调整: gamma_adv_w → {estimator.config.gamma_adv_w:.3f}")
+
+
 # -------------------------
 # small NN building blocks
 # -------------------------
@@ -658,6 +696,8 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             self.a_from_z.train(); self.y_from_w.train()
             self.adv_w.train(); self.adv_z.train(); self.adv_n.train()
 
+            epoch_loss = 0.0
+            epoch_batches = 0
             for vb, ab, yb in tr_loader:
                 vb = vb.to(self.device); ab = ab.to(self.device); yb = yb.to(self.device)
 
@@ -731,6 +771,8 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
 
                 self.main_opt.zero_grad(); loss_main.backward(); self.main_opt.step()
                 self._toggle_requires_grad([self.adv_w, self.adv_n, self.adv_z], True)
+                epoch_loss += float(loss_main.item())
+                epoch_batches += 1
 
             # validation
             self.enc_x.eval(); self.enc_w.eval(); self.enc_z.eval(); self.enc_n.eval()
@@ -751,6 +793,21 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     vals.append(float(loss_val.item()))
             mean_val = float(np.mean(vals)) if vals else float("inf")
             self.main_sched.step(mean_val)
+
+            if epoch_batches > 0 and epoch % 10 == 0:
+                try:
+                    # quick validation-based diagnostics for monitoring
+                    self._post_fit_quality_diagnostics(V_all=V_va, A=A_va, Y=Y_va)
+                except Exception:
+                    pass
+                enhanced_training_monitor(
+                    self,
+                    epoch,
+                    {
+                        "main": epoch_loss / max(1, epoch_batches),
+                        "val": mean_val,
+                    },
+                )
 
             if mean_val + cfg.early_stopping_min_delta < best_val:
                 best_val = mean_val
