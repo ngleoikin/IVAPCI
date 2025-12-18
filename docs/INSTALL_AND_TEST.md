@@ -175,6 +175,31 @@ python scripts/analyze_simulation_diagnostics.py \
 > - 请确保在仓库根目录运行，便于脚本写入 `outputs/...`。
 > - 如需缩短时间，可先只跑 `--scenarios EASY-linear-weak --n 200 --seeds 0` 验证流程。
 
+### 4.6 结果分析脚本（v22 专用快速汇总）
+
+新增脚本 `scripts/ivapci_v33_v22_analyzer.py` 可直接读取 CSV 并打印质量/重叠/对抗器等摘要，使用方式如下（可用默认文件名或显式指定路径）：
+
+```bash
+# 使用默认文件名（当前目录下）
+python scripts/ivapci_v33_v22_analyzer.py
+
+# 指定自定义路径示例
+python scripts/ivapci_v33_v22_analyzer.py \
+  --benchmark-file outputs/bench_small/simulation_benchmark_results.csv \
+  --diagnostics-file outputs/diag_small/simulation_diagnostics_results.csv \
+  --summary-file outputs/bench_small/simulation_benchmark_summary.csv
+```
+
+输出内容概览：
+- EXECUTIVE SUMMARY：MAE/RMSE、运行时间、质量评分分布、弱 IV / 排他性 / 重叠问题计数
+- 可识别性：IV 相关性、排他性统计及其与误差的相关性
+- 表征质量：Z→A、W→A AUC，排他性泄露 R²，[X,W,A]→Y 的 R²
+- 倾向性/重叠：倾向性分布、截断比例、重叠得分、ESS（若有）
+- 权重：截断前/后权重分布、截断比例、上限设置
+- 对抗器：W/N/Z 对抗器指标
+- 场景对比：各场景 RMSE / IV 强度 / 重叠，以及问题场景列表
+- 改进建议：基于弱 IV、截断比例、W 独立性、排他性泄露、权重等给出操作性建议
+
 ## 5. 常见问题
 
 - **安装缓慢或失败**：配置 PyPI 国内镜像或离线源后重试 `pip install -r requirements.txt`。
