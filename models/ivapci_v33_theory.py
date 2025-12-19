@@ -301,6 +301,10 @@ class IVAPCIV33TheoryConfig:
     y_hidden: Sequence[int] = (128, 64)
     adv_a_hidden: Sequence[int] = (64,)
     adv_y_hidden: Sequence[int] = (64,)
+    # conditional adversaries (Theorem 3B)
+    gamma_adv_w_cond: float = 0.12
+    gamma_adv_z_cond: float = 0.1
+    gamma_adv_n_cond: float = 0.08
 
     # optional independence penalty
     lambda_hsic: float = 0.015
@@ -317,6 +321,9 @@ class IVAPCIV33TheoryConfig:
     gamma_adv_w: float = 0.15
     gamma_adv_z: float = 0.12
     gamma_adv_n: float = 0.1
+    adv_steps: int = 3
+    adv_warmup_epochs: int = 5
+    adv_ramp_epochs: int = 20
     gamma_padic: float = 1e-3
 
     min_std: float = 1e-2
@@ -335,13 +342,21 @@ class IVAPCIV33TheoryConfig:
 
     n_splits_dr: int = 5
     clip_prop: float = 0.012
-    clip_prop_adaptive_max: float = 0.015
+    clip_prop_adaptive_max: float = 0.05
     clip_prop_radr: float = 1e-2
+    propensity_logreg_C: float = 0.2
+    propensity_shrinkage: float = 0.02
     ipw_cap: float = 12.0
+    ipw_cap_quantile: float = 0.995
     ipw_cap_high: float = 100.0
     ipw_cap_radr: Optional[float] = None
     adaptive_ipw: bool = True
     ess_target: float = 0.85
+
+    # overlap soft-penalty (stabilize propensity logits during training)
+    lambda_overlap: float = 0.02
+    overlap_margin: float = 0.05
+    overlap_warmup_epochs: int = 10
 
     seed: int = 42
     device: str = "cpu"
@@ -646,6 +661,13 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         self.adv_w = _AClassifier(cfg.latent_w_dim, cfg.adv_a_hidden).to(self.device)
         self.adv_n = _AClassifier(cfg.latent_n_dim, cfg.adv_a_hidden).to(self.device)
         self.adv_z = _YAdversary(cfg.latent_z_dim, cfg.adv_y_hidden).to(self.device)
+        # conditional adversaries
+        self.adv_w_cond = _AClassifier(cfg.latent_w_dim + cfg.latent_x_dim, cfg.adv_a_hidden).to(self.device)
+        self.adv_z_cond = _YAdversary(cfg.latent_z_dim + cfg.latent_x_dim + 1, cfg.adv_y_hidden).to(self.device)
+        self.adv_n_cond = _AClassifier(
+            cfg.latent_n_dim + cfg.latent_x_dim + cfg.latent_w_dim + cfg.latent_z_dim,
+            cfg.adv_a_hidden,
+        ).to(self.device)
 
         main_params = (
             list(self.enc_x.parameters())
@@ -661,7 +683,14 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         self.main_opt = torch.optim.Adam(main_params, lr=cfg.lr_main)
         self.main_sched = ReduceLROnPlateau(self.main_opt, mode="min", factor=0.5, patience=10)
 
-        adv_params = list(self.adv_w.parameters()) + list(self.adv_z.parameters()) + list(self.adv_n.parameters())
+        adv_params = (
+            list(self.adv_w.parameters())
+            + list(self.adv_z.parameters())
+            + list(self.adv_n.parameters())
+            + list(self.adv_w_cond.parameters())
+            + list(self.adv_z_cond.parameters())
+            + list(self.adv_n_cond.parameters())
+        )
         self.adv_opt = torch.optim.Adam(adv_params, lr=cfg.lr_adv)
 
     def _split_blocks_tensor(
@@ -782,6 +811,20 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             self.decoder.train(); self.a_head.train(); self.y_head.train()
             self.a_from_z.train(); self.y_from_w.train()
             self.adv_w.train(); self.adv_z.train(); self.adv_n.train()
+            self.adv_w_cond.train(); self.adv_z_cond.train(); self.adv_n_cond.train()
+
+            gamma_w_ep, gamma_z_ep, lambda_hsic_ep = adaptive_regularization_schedule(
+                epoch, cfg.epochs_main, getattr(self, "training_diagnostics", {}), cfg
+            )
+            adv_factor = 0.0 if epoch < cfg.adv_warmup_epochs else min(
+                1.0, (epoch - cfg.adv_warmup_epochs + 1) / max(1, cfg.adv_ramp_epochs)
+            )
+            gamma_w_use = gamma_w_ep * adv_factor
+            gamma_z_use = gamma_z_ep * adv_factor
+            gamma_n_use = cfg.gamma_adv_n * adv_factor
+            gamma_w_cond = cfg.gamma_adv_w_cond * adv_factor
+            gamma_z_cond = cfg.gamma_adv_z_cond * adv_factor
+            gamma_n_cond = cfg.gamma_adv_n_cond * adv_factor
 
             gamma_w_ep, gamma_z_ep, lambda_hsic_ep = adaptive_regularization_schedule(
                 epoch, cfg.epochs_main, getattr(self, "training_diagnostics", {}), cfg
@@ -794,14 +837,29 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 ab = ab.to(self.device, dtype=target_dtype)
                 yb = yb.to(self.device, dtype=target_dtype)
 
-                # adversaries update
-                with torch.no_grad():
-                    tx_d, tw_d, tz_d, tn_d = self._encode_blocks(vb)
-                adv_loss = bce(self.adv_w(tw_d), ab) + bce(self.adv_n(tn_d), ab) + mse(self.adv_z(tz_d), yb)
-                self.adv_opt.zero_grad(); adv_loss.backward(); self.adv_opt.step()
+                # adversaries update (multi-step, conditional)
+                if cfg.adv_steps > 0 and adv_factor > 0:
+                    for _ in range(cfg.adv_steps):
+                        with torch.no_grad():
+                            tx_d, tw_d, tz_d, tn_d = self._encode_blocks(vb)
+                        adv_inputs_w = torch.cat([tw_d, tx_d], dim=1)
+                        adv_inputs_z = torch.cat([tz_d, tx_d, ab.unsqueeze(1)], dim=1)
+                        adv_inputs_n = torch.cat([tn_d, tx_d, tw_d, tz_d], dim=1)
+                        adv_loss = (
+                            bce(self.adv_w(tw_d), ab)
+                            + bce(self.adv_n(tn_d), ab)
+                            + mse(self.adv_z(tz_d), yb)
+                            + bce(self.adv_w_cond(adv_inputs_w), ab)
+                            + mse(self.adv_z_cond(adv_inputs_z), yb)
+                            + bce(self.adv_n_cond(adv_inputs_n), ab)
+                        )
+                        self.adv_opt.zero_grad(); adv_loss.backward(); self.adv_opt.step()
 
                 # main update
-                self._toggle_requires_grad([self.adv_w, self.adv_n, self.adv_z], False)
+                self._toggle_requires_grad(
+                    [self.adv_w, self.adv_n, self.adv_z, self.adv_w_cond, self.adv_z_cond, self.adv_n_cond],
+                    False,
+                )
                 tx, tw, tz, tn = self._encode_blocks(vb)
                 recon = self.decoder(torch.cat([tx, tw, tz, tn], dim=1))
                 logits_a = self.a_head(torch.cat([tx, tz], dim=1))
@@ -828,9 +886,15 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     )
                     cond_ortho = cond_ortho_wz + cond_ortho_n
 
+                tx_det = tx.detach()
+                tw_det = tw.detach()
+                tz_det = tz.detach()
                 adv_w_logits = self.adv_w(tw)
                 adv_n_logits = self.adv_n(tn)
                 adv_z_pred = self.adv_z(tz)
+                adv_w_cond_logits = self.adv_w_cond(torch.cat([tw, tx_det], dim=1))
+                adv_z_cond_pred = self.adv_z_cond(torch.cat([tz, tx_det, ab.unsqueeze(1)], dim=1))
+                adv_n_cond_logits = self.adv_n_cond(torch.cat([tn, tx_det, tw_det, tz_det], dim=1))
 
                 hsic_pen = torch.zeros((), device=self.device)
                 if lambda_hsic_ep > 0:
@@ -848,6 +912,12 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                         + _rbf_hsic(tz_h, tn_h)
                     )
 
+                overlap_pen = torch.zeros((), device=self.device)
+                if cfg.lambda_overlap > 0 and epoch >= cfg.overlap_warmup_epochs:
+                    prob_a = torch.sigmoid(logits_a)
+                    m = cfg.overlap_margin
+                    overlap_pen = torch.mean(torch.relu(m - prob_a) ** 2 + torch.relu(m - (1 - prob_a)) ** 2)
+
                 loss_main = (
                     cfg.lambda_recon * mse(recon, vb)
                     + cfg.lambda_a * bce(logits_a, ab)
@@ -857,13 +927,20 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     + cond_weight * cond_ortho
                     + cfg.gamma_padic * _padic_ultrametric_loss(torch.cat([tx, tz], dim=1))
                     + lambda_hsic_ep * hsic_pen
-                    - gamma_w_ep * bce(adv_w_logits, ab)
-                    - cfg.gamma_adv_n * bce(adv_n_logits, ab)
-                    - gamma_z_ep * mse(adv_z_pred, yb)
+                    + cfg.lambda_overlap * overlap_pen
+                    - gamma_w_use * bce(adv_w_logits, ab)
+                    - gamma_n_use * bce(adv_n_logits, ab)
+                    - gamma_z_use * mse(adv_z_pred, yb)
+                    - gamma_w_cond * bce(adv_w_cond_logits, ab)
+                    - gamma_z_cond * mse(adv_z_cond_pred, yb)
+                    - gamma_n_cond * bce(adv_n_cond_logits, ab)
                 )
 
                 self.main_opt.zero_grad(); loss_main.backward(); self.main_opt.step()
-                self._toggle_requires_grad([self.adv_w, self.adv_n, self.adv_z], True)
+                self._toggle_requires_grad(
+                    [self.adv_w, self.adv_n, self.adv_z, self.adv_w_cond, self.adv_z_cond, self.adv_n_cond],
+                    True,
+                )
                 epoch_loss += float(loss_main.item())
                 epoch_batches += 1
 
@@ -912,6 +989,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     "decoder": self.decoder, "a_head": self.a_head, "y_head": self.y_head,
                     "a_from_z": self.a_from_z, "y_from_w": self.y_from_w,
                     "adv_w": self.adv_w, "adv_z": self.adv_z, "adv_n": self.adv_n,
+                    "adv_w_cond": self.adv_w_cond, "adv_z_cond": self.adv_z_cond, "adv_n_cond": self.adv_n_cond,
                 }.items()}
             else:
                 patience += 1
@@ -931,6 +1009,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             self.adv_w.load_state_dict(best_state["adv_w"])
             self.adv_z.load_state_dict(best_state["adv_z"])
             self.adv_n.load_state_dict(best_state["adv_n"])
+            self.adv_w_cond.load_state_dict(best_state["adv_w_cond"])
+            self.adv_z_cond.load_state_dict(best_state["adv_z_cond"])
+            self.adv_n_cond.load_state_dict(best_state["adv_n_cond"])
 
         self._is_fit = True
 
@@ -958,6 +1039,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
 
         self.enc_x.eval(); self.enc_w.eval(); self.enc_z.eval(); self.enc_n.eval()
         self.adv_w.eval(); self.adv_n.eval(); self.adv_z.eval()
+        self.adv_w_cond.eval(); self.adv_z_cond.eval(); self.adv_n_cond.eval()
         with torch.no_grad():
             tx, tw, tz, tn = self._encode_blocks(V_t)
             adv_w_probs = torch.sigmoid(self.adv_w(tw)).cpu().numpy()
@@ -1056,9 +1138,12 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             if np.unique(A_tr).size < 2:
                 e_raw = np.full_like(A_te, float(np.mean(A_tr)) if len(A_tr) else 0.5, dtype=float)
             else:
-                prop = LogisticRegression(max_iter=2000, solver="lbfgs")
+                prop = LogisticRegression(max_iter=2000, solver="lbfgs", C=cfg.propensity_logreg_C)
                 prop.fit(U_tr_s, A_tr)
                 e_raw = prop.predict_proba(U_te_s)[:, 1]
+            if cfg.propensity_shrinkage > 0:
+                prior = float(np.mean(A_tr)) if len(A_tr) else 0.5
+                e_raw = (1 - cfg.propensity_shrinkage) * e_raw + cfg.propensity_shrinkage * prior
             # adaptive clip based on ESS
             clip_use = float(cfg.clip_prop)
             if cfg.adaptive_ipw:
@@ -1263,9 +1348,12 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
             if np.unique(A_tr).size < 2:
                 e_raw = np.full_like(A_te, float(np.mean(A_tr)) if len(A_tr) else 0.5, dtype=float)
             else:
-                prop = LogisticRegression(max_iter=2000, solver="lbfgs")
+                prop = LogisticRegression(max_iter=2000, solver="lbfgs", C=cfg.propensity_logreg_C)
                 prop.fit(Xp_tr, A_tr)
                 e_raw = prop.predict_proba(Xp_te)[:, 1]
+            if cfg.propensity_shrinkage > 0:
+                prior = float(np.mean(A_tr)) if len(A_tr) else 0.5
+                e_raw = (1 - cfg.propensity_shrinkage) * e_raw + cfg.propensity_shrinkage * prior
 
             qs = _quantiles(e_raw)
             clip_use = clip
@@ -1329,7 +1417,13 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
             w = (A_te - e_hat) / (e_hat * (1 - e_hat))
             stats["ipw_abs_max_postclip_precap"].append(float(np.max(np.abs(w))) if w.size else np.nan)
 
-            w_capped = np.clip(w, -float(ipw_cap), float(ipw_cap)) if ipw_cap and ipw_cap > 0 else w
+            if ipw_cap and ipw_cap > 0:
+                cap_val = float(ipw_cap)
+                if cfg.ipw_cap_quantile is not None and 0 < cfg.ipw_cap_quantile < 1 and w.size:
+                    cap_val = min(cap_val, float(np.quantile(np.abs(w), cfg.ipw_cap_quantile)))
+                w_capped = np.clip(w, -cap_val, cap_val)
+            else:
+                w_capped = w
             stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w_capped))) if w_capped.size else np.nan)
             if ipw_cap and ipw_cap > 0:
                 stats["frac_ipw_capped"].append(
