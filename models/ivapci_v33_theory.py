@@ -41,16 +41,17 @@ def _info_aware_standardize(
     Returns:
         train_std, mean, std_clamped, protected_mask
     """
-    mean = train.mean(axis=0, keepdims=True)
-    std = train.std(axis=0, keepdims=True)
+    train = np.asarray(train, dtype=np.float32)
+    mean = train.mean(axis=0, keepdims=True, dtype=np.float32)
+    std = train.std(axis=0, keepdims=True, dtype=np.float32)
     protected = (std < min_std).squeeze(0)
 
     # Preserve true (small) std for low-variance channels; only apply a tiny floor to avoid divide-by-zero.
-    std_clamped = np.where(std < low_var_min_std, np.maximum(std, low_var_min_std), std)
-    standardized = (train - mean) / std_clamped
+    std_clamped = np.where(std < low_var_min_std, np.maximum(std, low_var_min_std), std).astype(np.float32)
+    standardized = ((train - mean) / std_clamped).astype(np.float32)
     if clip_value is not None:
-        standardized = np.clip(standardized, -clip_value, clip_value)
-    return standardized, mean, std_clamped, protected
+        standardized = np.clip(standardized, -clip_value, clip_value).astype(np.float32)
+    return standardized, mean.astype(np.float32), std_clamped, protected
 
 
 def _effective_sample_size(weights: np.ndarray) -> float:
@@ -62,7 +63,10 @@ def _effective_sample_size(weights: np.ndarray) -> float:
 
 
 def _apply_standardize(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    return (x - mean) / std
+    x_f = np.asarray(x, dtype=np.float32)
+    mean_f = np.asarray(mean, dtype=np.float32)
+    std_f = np.asarray(std, dtype=np.float32)
+    return (x_f - mean_f) / std_f
 
 
 class InformationLossMonitor:
@@ -266,6 +270,16 @@ def _rbf_hsic(x: torch.Tensor, y: torch.Tensor, sigma: Optional[float] = None) -
 
 @dataclass
 class IVAPCIV33TheoryConfig:
+    """Theory-informed default configuration balancing theorems 1–5.
+
+    Tuned for the "v3.3" setting with emphasis on:
+    - Theorem 2 prioritization (information integrity before aggressive constraints)
+    - Gradual conditional orthogonality (Theorem 3A) via longer warmup
+    - Moderate adversarial weights (Theorem 3B) to avoid over-penalization
+    - Mildly strengthened consistency (Theorem 3C) to counteract disentanglement difficulty
+    - Sample-efficiency safeguards (Theorem 4–5) through adaptive defaults
+    """
+
     x_dim: int = 0
     w_dim: int = 0
     z_dim: int = 0
@@ -289,19 +303,19 @@ class IVAPCIV33TheoryConfig:
     adv_y_hidden: Sequence[int] = (64,)
 
     # optional independence penalty
-    lambda_hsic: float = 0.05
+    lambda_hsic: float = 0.015
     hsic_max_samples: int = 256
 
     lambda_recon: float = 1.0
     lambda_a: float = 0.1
     lambda_y: float = 0.5
     lambda_ortho: float = 0.01
-    lambda_cond_ortho: float = 2e-3
-    lambda_consistency: float = 0.05
+    lambda_cond_ortho: float = 1e-3
+    lambda_consistency: float = 0.08
     ridge_alpha: float = 1e-2
     standardize_nuisance: bool = True
-    gamma_adv_w: float = 0.3
-    gamma_adv_z: float = 0.2
+    gamma_adv_w: float = 0.15
+    gamma_adv_z: float = 0.12
     gamma_adv_n: float = 0.1
     gamma_padic: float = 1e-3
 
@@ -314,16 +328,16 @@ class IVAPCIV33TheoryConfig:
     lr_adv: float = 1e-3
     batch_size: int = 128
     epochs_pretrain: int = 50
-    epochs_main: int = 200
+    epochs_main: int = 160
     val_frac: float = 0.1
-    early_stopping_patience: int = 20
+    early_stopping_patience: int = 18
     early_stopping_min_delta: float = 0.0
 
     n_splits_dr: int = 5
-    clip_prop: float = 2e-2
-    clip_prop_adaptive_max: float = 2e-2
+    clip_prop: float = 0.012
+    clip_prop_adaptive_max: float = 0.015
     clip_prop_radr: float = 1e-2
-    ipw_cap: float = 15.0
+    ipw_cap: float = 12.0
     ipw_cap_high: float = 100.0
     ipw_cap_radr: Optional[float] = None
     adaptive_ipw: bool = True
@@ -332,7 +346,7 @@ class IVAPCIV33TheoryConfig:
     seed: int = 42
     device: str = "cpu"
 
-    cond_ortho_warmup_epochs: int = 5
+    cond_ortho_warmup_epochs: int = 15
 
     n_samples_hint: Optional[int] = None
     adaptive: bool = True
@@ -349,20 +363,89 @@ class IVAPCIV33TheoryConfig:
         self.latent_n_dim = max(2, base // 3)
 
         self.lambda_ortho = 0.005 * np.sqrt(np.log1p(n))
-        self.lambda_consistency = 0.02 * np.sqrt(np.log1p(n))
+        self.lambda_consistency = 0.04 * np.sqrt(np.log1p(n))
 
         decay = 1.0 / np.sqrt(np.log1p(n))
-        self.gamma_adv_w = 0.2 * decay
-        self.gamma_adv_z = 0.2 * decay
-        self.gamma_adv_n = 0.2 * decay
+        scale_decay = min(1.0, 1.5 * decay)
+        self.gamma_adv_w = 0.15 * scale_decay
+        self.gamma_adv_z = 0.12 * scale_decay
+        self.gamma_adv_n = 0.10 * scale_decay
 
         self.gamma_padic = 0.001 * np.sqrt(np.log1p(n))
         self.min_std = max(1e-4, 1e-2 / np.sqrt(np.log1p(n)))
         self.low_var_min_std = min(self.low_var_min_std, self.min_std * 0.1)
 
         self.epochs_pretrain = int(min(80, 30 + 10 * np.log1p(n / 500)))
-        self.epochs_main = int(min(250, 80 + 20 * np.log1p(n / 500)))
+        self.epochs_main = int(min(220, 100 + 15 * np.log1p(n / 500)))
         return self
+
+
+def adaptive_regularization_schedule(
+    epoch: int,
+    total_epochs: int,
+    diagnostics: dict,
+    config: IVAPCIV33TheoryConfig,
+) -> tuple[float, float, float]:
+    """Dynamic adjustment of adversarial and HSIC weights.
+
+    Balances Theorem 2 (information preservation) and Theorem 3 (exclusion/independence)
+    with a gentle phase schedule:
+    - Early phase: looser constraints for expressiveness
+    - Mid phase: nominal weights
+    - Late phase: slightly stronger constraints to tighten identifiability
+    Diagnostic cues allow reacting to W→A leakage and Z-exclusion leakage.
+    Returns (gamma_adv_w, gamma_adv_z, lambda_hsic).
+    """
+
+    base_w = config.gamma_adv_w
+    base_z = config.gamma_adv_z
+    base_hsic = config.lambda_hsic
+
+    if epoch < total_epochs * 0.3:
+        phase_scale = 0.7
+    elif epoch < total_epochs * 0.7:
+        phase_scale = 1.0
+    else:
+        phase_scale = 1.2
+
+    info_loss = diagnostics.get("info_loss_proxy", 0.015)
+    if info_loss > 0.018:
+        info_scale = 0.8
+    elif info_loss < 0.014:
+        info_scale = 1.1
+    else:
+        info_scale = 1.0
+
+    w_auc = diagnostics.get("rep_auc_w_to_a", 0.5)
+    w_dev = abs(w_auc - 0.5)
+    if w_dev > 0.18:
+        w_boost = 1.5
+    elif w_dev > 0.12:
+        w_boost = 1.2
+    elif w_dev < 0.08:
+        w_boost = 0.9
+    else:
+        w_boost = 1.0
+
+    z_leak = diagnostics.get("rep_exclusion_leakage_r2", 0.15)
+    if z_leak > 0.20:
+        z_boost = 1.5
+    elif z_leak > 0.15:
+        z_boost = 1.2
+    elif z_leak < 0.10:
+        z_boost = 0.9
+    else:
+        z_boost = 1.0
+
+    gamma_w = base_w * phase_scale * info_scale * w_boost
+    gamma_z = base_z * phase_scale * info_scale * z_boost
+    lambda_h = base_hsic * phase_scale * info_scale
+
+    gamma_w = float(np.clip(gamma_w, 0.05, 0.4))
+    gamma_z = float(np.clip(gamma_z, 0.05, 0.3))
+    lambda_h = float(np.clip(lambda_h, 0.005, 0.05))
+
+    return gamma_w, gamma_z, lambda_h
 
 
 # -------------------------
@@ -594,6 +677,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
     def _encode_blocks(
         self, V_t: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        target_dtype = next(self.enc_x.parameters()).dtype
+        if V_t.dtype != target_dtype:
+            V_t = V_t.to(dtype=target_dtype)
         x_part, w_part, z_part = self._split_blocks_tensor(V_t)
         tx = self.enc_x(x_part)
         tw = self.enc_w(w_part)
@@ -656,6 +742,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         Y_va_std = _apply_standardize(Y_va.reshape(-1, 1), self._y_mean, self._y_std).squeeze(1)
 
         self._build(d_all)
+        target_dtype = next(self.enc_x.parameters()).dtype
 
         bce = nn.BCEWithLogitsLoss()
         mse = nn.MSELoss()
@@ -696,10 +783,16 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             self.a_from_z.train(); self.y_from_w.train()
             self.adv_w.train(); self.adv_z.train(); self.adv_n.train()
 
+            gamma_w_ep, gamma_z_ep, lambda_hsic_ep = adaptive_regularization_schedule(
+                epoch, cfg.epochs_main, getattr(self, "training_diagnostics", {}), cfg
+            )
+
             epoch_loss = 0.0
             epoch_batches = 0
             for vb, ab, yb in tr_loader:
-                vb = vb.to(self.device); ab = ab.to(self.device); yb = yb.to(self.device)
+                vb = vb.to(self.device, dtype=target_dtype)
+                ab = ab.to(self.device, dtype=target_dtype)
+                yb = yb.to(self.device, dtype=target_dtype)
 
                 # adversaries update
                 with torch.no_grad():
@@ -740,7 +833,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 adv_z_pred = self.adv_z(tz)
 
                 hsic_pen = torch.zeros((), device=self.device)
-                if cfg.lambda_hsic > 0:
+                if lambda_hsic_ep > 0:
                     # subsample for stability
                     if tx.shape[0] > cfg.hsic_max_samples:
                         idx = torch.randperm(tx.shape[0], device=self.device)[: cfg.hsic_max_samples]
@@ -763,10 +856,10 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     + cfg.lambda_ortho * ortho
                     + cond_weight * cond_ortho
                     + cfg.gamma_padic * _padic_ultrametric_loss(torch.cat([tx, tz], dim=1))
-                    + cfg.lambda_hsic * hsic_pen
-                    - cfg.gamma_adv_w * bce(adv_w_logits, ab)
+                    + lambda_hsic_ep * hsic_pen
+                    - gamma_w_ep * bce(adv_w_logits, ab)
                     - cfg.gamma_adv_n * bce(adv_n_logits, ab)
-                    - cfg.gamma_adv_z * mse(adv_z_pred, yb)
+                    - gamma_z_ep * mse(adv_z_pred, yb)
                 )
 
                 self.main_opt.zero_grad(); loss_main.backward(); self.main_opt.step()
@@ -780,7 +873,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             vals = []
             with torch.no_grad():
                 for vb, ab, yb in va_loader:
-                    vb = vb.to(self.device); ab = ab.to(self.device); yb = yb.to(self.device)
+                    vb = vb.to(self.device, dtype=target_dtype)
+                    ab = ab.to(self.device, dtype=target_dtype)
+                    yb = yb.to(self.device, dtype=target_dtype)
                     tx, tw, tz, tn = self._encode_blocks(vb)
                     recon = self.decoder(torch.cat([tx, tw, tz, tn], dim=1))
                     logits_a = self.a_head(torch.cat([tx, tz], dim=1))
