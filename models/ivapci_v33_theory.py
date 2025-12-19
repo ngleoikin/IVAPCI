@@ -826,6 +826,10 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             gamma_z_cond = cfg.gamma_adv_z_cond * adv_factor
             gamma_n_cond = cfg.gamma_adv_n_cond * adv_factor
 
+            gamma_w_ep, gamma_z_ep, lambda_hsic_ep = adaptive_regularization_schedule(
+                epoch, cfg.epochs_main, getattr(self, "training_diagnostics", {}), cfg
+            )
+
             epoch_loss = 0.0
             epoch_batches = 0
             for vb, ab, yb in tr_loader:
