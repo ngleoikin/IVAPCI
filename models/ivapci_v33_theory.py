@@ -65,6 +65,12 @@ def _effective_sample_size(weights: np.ndarray) -> float:
 def _compute_residual(target: torch.Tensor, condition: torch.Tensor, ridge: float = 1e-3) -> torch.Tensor:
     """Project out ``condition`` from ``target`` to approximate conditional adversaries."""
 
+    # Align batch sizes to avoid shape mismatches when the last minibatch is smaller.
+    if target.shape[0] != condition.shape[0]:
+        min_n = min(int(target.shape[0]), int(condition.shape[0]))
+        target = target[:min_n]
+        condition = condition[:min_n]
+
     condition_c = condition - condition.mean(dim=0, keepdim=True)
     target_c = target - target.mean(dim=0, keepdim=True)
 
