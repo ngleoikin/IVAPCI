@@ -1174,6 +1174,10 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 cons_y = mse(self.y_from_w(tw, ab), yb)
                 consistency = cons_a + cons_y
 
+                tx_det = tx.detach()
+                tw_det = tw.detach()
+                tz_det = tz.detach()
+
                 ortho = _offdiag_corr_penalty([tx, tw, tz, tn])
                 warmup = cfg.cond_ortho_warmup_epochs
                 cond_weight = 0.0
@@ -1190,10 +1194,6 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     tn_res = _compute_residual(tn, tn_cond, ridge=cfg.ridge_alpha)
                     cond_ortho_n = _offdiag_corr_penalty([tn_res, tx_det, tw_det, tz_det])
                     cond_ortho = cond_ortho_wz + cond_ortho_n
-
-                tx_det = tx.detach()
-                tw_det = tw.detach()
-                tz_det = tz.detach()
                 adv_w_logits = self.adv_w(tw)
                 adv_n_logits = self.adv_n(tn)
                 adv_z_pred = self.adv_z(tz)
