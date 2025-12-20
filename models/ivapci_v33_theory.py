@@ -56,10 +56,102 @@ def _info_aware_standardize(
 
 def _effective_sample_size(weights: np.ndarray) -> float:
     if weights.size == 0:
-        return float("nan")
+        return 0.0
     num = float(np.sum(weights) ** 2)
     den = float(np.sum(weights**2) + 1e-12)
-    return num / den if den > 0 else float("nan")
+    return num / den if den > 0 else 0.0
+
+
+def _compute_residual(target: torch.Tensor, condition: torch.Tensor, ridge: float = 1e-3) -> torch.Tensor:
+    """Project out ``condition`` from ``target`` to approximate conditional adversaries."""
+
+    condition_c = condition - condition.mean(dim=0, keepdim=True)
+    target_c = target - target.mean(dim=0, keepdim=True)
+
+    ct_c = condition_c.T @ condition_c / max(1, condition_c.shape[0])
+    i_eye = torch.eye(ct_c.shape[0], device=condition.device, dtype=condition.dtype)
+    ct_t = condition_c.T @ target_c / max(1, condition_c.shape[0])
+    try:
+        beta = torch.linalg.solve(ct_c + ridge * i_eye, ct_t)
+    except RuntimeError:
+        beta = torch.zeros(condition_c.shape[1], target_c.shape[1], device=condition.device, dtype=condition.dtype)
+    target_res = target_c - condition_c @ beta
+    return target_res
+
+
+def compute_ess_by_group(e_hat: np.ndarray, A: np.ndarray) -> Tuple[float, float]:
+    eps = 1e-8
+    treated_mask = A == 1
+    control_mask = A == 0
+
+    if treated_mask.sum() > 0:
+        w_treated = 1.0 / np.clip(e_hat[treated_mask], eps, 1 - eps)
+        ess_treated = _effective_sample_size(w_treated) / treated_mask.sum()
+    else:
+        ess_treated = 0.0
+
+    if control_mask.sum() > 0:
+        w_control = 1.0 / np.clip(1 - e_hat[control_mask], eps, 1 - eps)
+        ess_control = _effective_sample_size(w_control) / control_mask.sum()
+    else:
+        ess_control = 0.0
+
+    return ess_treated, ess_control
+
+
+def find_optimal_clip_threshold(
+    e_raw: np.ndarray,
+    A: np.ndarray,
+    ess_target: float,
+    min_clip: float,
+    max_clip: float,
+    n_search: int = 20,
+) -> Tuple[float, dict]:
+    candidates = np.linspace(min_clip, max_clip, n_search)
+    best_clip = max_clip
+    best_min_ess = 0.0
+
+    for clip_val in candidates:
+        e_clipped = np.clip(e_raw, clip_val, 1 - clip_val)
+        ess_t, ess_c = compute_ess_by_group(e_clipped, A)
+        min_ess = min(ess_t, ess_c)
+        if min_ess >= ess_target:
+            best_clip = clip_val
+            best_min_ess = min_ess
+            break
+        if min_ess > best_min_ess:
+            best_clip = clip_val
+            best_min_ess = min_ess
+
+    e_final = np.clip(e_raw, best_clip, 1 - best_clip)
+    ess_t, ess_c = compute_ess_by_group(e_final, A)
+
+    eps = 1e-8
+    w_ate = A / np.clip(e_final, eps, 1 - eps) + (1 - A) / np.clip(1 - e_final, eps, 1 - eps)
+    overall_ess = _effective_sample_size(w_ate)
+    overall_ess_ratio = overall_ess / len(A) if len(A) else 0.0
+
+    stats = {
+        "clip_threshold": float(best_clip),
+        "ess_treated": float(ess_t),
+        "ess_control": float(ess_c),
+        "ess_min": float(min(ess_t, ess_c)),
+        "ess_overall_ratio": float(overall_ess_ratio),
+        "frac_clipped": float(np.mean((e_raw < best_clip) | (e_raw > 1 - best_clip))),
+    }
+    return float(best_clip), stats
+
+
+def adaptive_ipw_cap_by_quantile(
+    weights: np.ndarray,
+    quantile: float,
+    min_cap: float,
+    max_cap: float,
+) -> float:
+    if weights.size == 0:
+        return min_cap
+    cap_candidate = float(np.quantile(np.abs(weights), quantile))
+    return float(np.clip(cap_candidate, min_cap, max_cap))
 
 
 def _apply_standardize(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
@@ -341,17 +433,22 @@ class IVAPCIV33TheoryConfig:
     early_stopping_min_delta: float = 0.0
 
     n_splits_dr: int = 5
-    clip_prop: float = 0.012
-    clip_prop_adaptive_max: float = 0.05
+    clip_prop: float = 0.01
+    clip_prop_adaptive_max: float = 0.08
     clip_prop_radr: float = 1e-2
-    propensity_logreg_C: float = 0.2
+    propensity_logreg_C: float = 0.5
     propensity_shrinkage: float = 0.02
-    ipw_cap: float = 12.0
+    ipw_cap: float = 20.0
     ipw_cap_quantile: float = 0.995
     ipw_cap_high: float = 100.0
     ipw_cap_radr: Optional[float] = None
     adaptive_ipw: bool = True
-    ess_target: float = 0.85
+    ess_target: float = 0.75
+
+    # overlap soft-penalty (stabilize propensity logits during training)
+    lambda_overlap: float = 0.02
+    overlap_margin: float = 0.05
+    overlap_warmup_epochs: int = 10
 
     # overlap soft-penalty (stabilize propensity logits during training)
     lambda_overlap: float = 0.02
@@ -661,13 +758,10 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         self.adv_w = _AClassifier(cfg.latent_w_dim, cfg.adv_a_hidden).to(self.device)
         self.adv_n = _AClassifier(cfg.latent_n_dim, cfg.adv_a_hidden).to(self.device)
         self.adv_z = _YAdversary(cfg.latent_z_dim, cfg.adv_y_hidden).to(self.device)
-        # conditional adversaries
-        self.adv_w_cond = _AClassifier(cfg.latent_w_dim + cfg.latent_x_dim, cfg.adv_a_hidden).to(self.device)
-        self.adv_z_cond = _YAdversary(cfg.latent_z_dim + cfg.latent_x_dim + 1, cfg.adv_y_hidden).to(self.device)
-        self.adv_n_cond = _AClassifier(
-            cfg.latent_n_dim + cfg.latent_x_dim + cfg.latent_w_dim + cfg.latent_z_dim,
-            cfg.adv_a_hidden,
-        ).to(self.device)
+        # conditional adversaries use residualized targets (condition projected out)
+        self.adv_w_cond = _AClassifier(cfg.latent_w_dim, cfg.adv_a_hidden).to(self.device)
+        self.adv_z_cond = _YAdversary(cfg.latent_z_dim, cfg.adv_y_hidden).to(self.device)
+        self.adv_n_cond = _AClassifier(cfg.latent_n_dim, cfg.adv_a_hidden).to(self.device)
 
         main_params = (
             list(self.enc_x.parameters())
@@ -826,10 +920,6 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             gamma_z_cond = cfg.gamma_adv_z_cond * adv_factor
             gamma_n_cond = cfg.gamma_adv_n_cond * adv_factor
 
-            gamma_w_ep, gamma_z_ep, lambda_hsic_ep = adaptive_regularization_schedule(
-                epoch, cfg.epochs_main, getattr(self, "training_diagnostics", {}), cfg
-            )
-
             epoch_loss = 0.0
             epoch_batches = 0
             for vb, ab, yb in tr_loader:
@@ -842,16 +932,20 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     for _ in range(cfg.adv_steps):
                         with torch.no_grad():
                             tx_d, tw_d, tz_d, tn_d = self._encode_blocks(vb)
-                        adv_inputs_w = torch.cat([tw_d, tx_d], dim=1)
-                        adv_inputs_z = torch.cat([tz_d, tx_d, ab.unsqueeze(1)], dim=1)
-                        adv_inputs_n = torch.cat([tn_d, tx_d, tw_d, tz_d], dim=1)
+                        tw_res = _compute_residual(tw_d, tx_d, ridge=cfg.ridge_alpha)
+                        tz_res = _compute_residual(
+                            tz_d, torch.cat([tx_d, ab.unsqueeze(1)], dim=1), ridge=cfg.ridge_alpha
+                        )
+                        tn_res = _compute_residual(
+                            tn_d, torch.cat([tx_d, tw_d, tz_d], dim=1), ridge=cfg.ridge_alpha
+                        )
                         adv_loss = (
                             bce(self.adv_w(tw_d), ab)
                             + bce(self.adv_n(tn_d), ab)
                             + mse(self.adv_z(tz_d), yb)
-                            + bce(self.adv_w_cond(adv_inputs_w), ab)
-                            + mse(self.adv_z_cond(adv_inputs_z), yb)
-                            + bce(self.adv_n_cond(adv_inputs_n), ab)
+                            + bce(self.adv_w_cond(tw_res), ab)
+                            + mse(self.adv_z_cond(tz_res), yb)
+                            + bce(self.adv_n_cond(tn_res), ab)
                         )
                         self.adv_opt.zero_grad(); adv_loss.backward(); self.adv_opt.step()
 
@@ -889,12 +983,19 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 tx_det = tx.detach()
                 tw_det = tw.detach()
                 tz_det = tz.detach()
+                tw_res = _compute_residual(tw, tx_det, ridge=cfg.ridge_alpha)
+                tz_res = _compute_residual(
+                    tz, torch.cat([tx_det, ab.unsqueeze(1)], dim=1), ridge=cfg.ridge_alpha
+                )
+                tn_res = _compute_residual(
+                    tn, torch.cat([tx_det, tw_det, tz_det], dim=1), ridge=cfg.ridge_alpha
+                )
                 adv_w_logits = self.adv_w(tw)
                 adv_n_logits = self.adv_n(tn)
                 adv_z_pred = self.adv_z(tz)
-                adv_w_cond_logits = self.adv_w_cond(torch.cat([tw, tx_det], dim=1))
-                adv_z_cond_pred = self.adv_z_cond(torch.cat([tz, tx_det, ab.unsqueeze(1)], dim=1))
-                adv_n_cond_logits = self.adv_n_cond(torch.cat([tn, tx_det, tw_det, tz_det], dim=1))
+                adv_w_cond_logits = self.adv_w_cond(tw_res)
+                adv_z_cond_pred = self.adv_z_cond(tz_res)
+                adv_n_cond_logits = self.adv_n_cond(tn_res)
 
                 hsic_pen = torch.zeros((), device=self.device)
                 if lambda_hsic_ep > 0:
@@ -1107,6 +1208,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         stats = {k: [] for k in [
             "e_min", "e_max", "e_q01", "e_q05", "e_q95", "e_q99",
             "clip_used", "cap_used", "frac_e_clipped", "overlap_score", "ess_raw",
+            "ess_overall_ratio", "ess_min", "clip_threshold",
             "ipw_abs_max_raw", "ipw_abs_max_postclip_precap", "ipw_abs_max_capped", "frac_ipw_capped",
         ]}
 
@@ -1144,31 +1246,28 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             if cfg.propensity_shrinkage > 0:
                 prior = float(np.mean(A_tr)) if len(A_tr) else 0.5
                 e_raw = (1 - cfg.propensity_shrinkage) * e_raw + cfg.propensity_shrinkage * prior
-            # adaptive clip based on ESS
-            clip_use = float(cfg.clip_prop)
-            if cfg.adaptive_ipw:
-                eps = 1e-6
-                w_ate_raw = A_te / np.clip(e_raw, eps, 1 - eps) + (1 - A_te) / np.clip(1 - e_raw, eps, 1 - eps)
-                ess_raw = _effective_sample_size(w_ate_raw)
-                ess_ratio = ess_raw / len(A_te) if len(A_te) else np.nan
-                if np.isfinite(ess_ratio) and ess_ratio < cfg.ess_target:
-                    adj = cfg.ess_target - ess_ratio
-                    clip_use = min(cfg.clip_prop_adaptive_max, max(clip_use, clip_use + 0.05 * adj))
-                stats["ess_raw"].append(float(ess_raw) if np.isfinite(ess_raw) else np.nan)
-            else:
-                stats["ess_raw"].append(np.nan)
+            min_clip = max(float(cfg.clip_prop), 0.05) if weak_iv else float(cfg.clip_prop)
+            max_clip = max(min_clip, float(cfg.clip_prop_adaptive_max))
+            clip_use, clip_stats = find_optimal_clip_threshold(
+                e_raw=e_raw,
+                A=A_te,
+                ess_target=float(cfg.ess_target),
+                min_clip=min_clip,
+                max_clip=max_clip,
+                n_search=20,
+            )
+            stats["ess_raw"].append(float(clip_stats.get("ess_overall_ratio", np.nan)))
+            stats["ess_overall_ratio"].append(float(clip_stats.get("ess_overall_ratio", np.nan)))
+            stats["ess_min"].append(float(clip_stats.get("ess_min", np.nan)))
+            stats["clip_threshold"].append(float(clip_stats.get("clip_threshold", clip_use)))
             cap_use = float(cfg.ipw_cap) if cfg.ipw_cap is not None else np.nan
-            if weak_iv:
-                clip_use = max(clip_use, 0.05)
-                if np.isfinite(cap_use):
-                    cap_use = min(cap_use, 10.0)
+            if weak_iv and np.isfinite(cap_use):
+                cap_use = min(cap_use, 10.0)
             e_hat = np.clip(e_raw, clip_use, 1 - clip_use)
 
             qs = _quantiles(e_raw)
             for k, v in qs.items():
                 stats[f"e_{k}"].append(v)
-            stats["clip_used"].append(clip_use)
-            stats["cap_used"].append(cap_use)
             stats["frac_e_clipped"].append(float(np.mean((e_raw < clip_use) | (e_raw > 1 - clip_use))))
             stats["overlap_score"].append(float(np.mean((e_raw > clip_use) & (e_raw < 1 - clip_use))))
 
@@ -1199,16 +1298,27 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             stats["ipw_abs_max_raw"].append(float(np.max(np.abs(w_raw))) if w_raw.size else np.nan)
 
             w = (A_te - e_hat) / (e_hat * (1 - e_hat))
+            cap_used = cap_use
+            if cfg.ipw_cap_quantile is not None:
+                cap_used = adaptive_ipw_cap_by_quantile(
+                    weights=w,
+                    quantile=float(cfg.ipw_cap_quantile),
+                    min_cap=5.0,
+                    max_cap=float(cfg.ipw_cap) if cfg.ipw_cap is not None else 50.0,
+                )
             stats["ipw_abs_max_postclip_precap"].append(float(np.max(np.abs(w))) if w.size else np.nan)
-            if np.isfinite(cap_use) and cap_use > 0:
-                w = np.clip(w, -float(cap_use), float(cap_use))
+            if np.isfinite(cap_used) and cap_used > 0:
+                w = np.clip(w, -float(cap_used), float(cap_used))
                 stats["ipw_abs_max_capped"].append(float(np.max(np.abs(w))) if w.size else np.nan)
                 stats["frac_ipw_capped"].append(
-                    float(np.mean(np.abs(w_raw) >= float(cap_use))) if w_raw.size else np.nan
+                    float(np.mean(np.abs(w_raw) >= float(cap_used))) if w_raw.size else np.nan
                 )
             else:
                 stats["ipw_abs_max_capped"].append(np.nan)
                 stats["frac_ipw_capped"].append(np.nan)
+
+            stats["clip_used"].append(clip_use)
+            stats["cap_used"].append(cap_used)
 
             psi[te] = m1 - m0 + w * (Y_te - m_hat)
         if stats and hasattr(self, "training_diagnostics"):
