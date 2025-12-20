@@ -79,6 +79,19 @@ def _compute_residual(target: torch.Tensor, condition: torch.Tensor, ridge: floa
     return target_res
 
 
+class TrueConditionalAdversary(nn.Module):
+    """Conditional adversary via concat+detach to avoid leakage through conditions."""
+
+    def __init__(self, target_dim: int, condition_dim: int, hidden: Sequence[int]):
+        super().__init__()
+        self.discriminator = _mlp(target_dim + condition_dim, hidden, 1)
+
+    def forward(self, target: torch.Tensor, condition: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
+        combined = torch.cat([target, condition.detach()], dim=1)
+        logits = self.discriminator(combined).squeeze(-1)
+        return nn.functional.binary_cross_entropy_with_logits(logits, label)
+
+
 def compute_ess_by_group(e_hat: np.ndarray, A: np.ndarray) -> Tuple[float, float]:
     eps = 1e-8
     treated_mask = A == 1
@@ -414,8 +427,8 @@ class IVAPCIV33TheoryConfig:
     gamma_adv_z: float = 0.12
     gamma_adv_n: float = 0.1
     adv_steps: int = 3
-    adv_warmup_epochs: int = 5
-    adv_ramp_epochs: int = 20
+    adv_warmup_epochs: int = 10
+    adv_ramp_epochs: int = 30
     gamma_padic: float = 1e-3
 
     min_std: float = 1e-2
@@ -424,7 +437,7 @@ class IVAPCIV33TheoryConfig:
     use_noise_in_latent: bool = True
 
     lr_main: float = 1e-3
-    lr_adv: float = 1e-3
+    lr_adv: float = 1.5e-3
     batch_size: int = 128
     epochs_pretrain: int = 50
     epochs_main: int = 160
@@ -434,16 +447,16 @@ class IVAPCIV33TheoryConfig:
 
     n_splits_dr: int = 5
     clip_prop: float = 0.01
-    clip_prop_adaptive_max: float = 0.08
+    clip_prop_adaptive_max: float = 0.06
     clip_prop_radr: float = 1e-2
     propensity_logreg_C: float = 0.5
     propensity_shrinkage: float = 0.02
-    ipw_cap: float = 20.0
+    ipw_cap: float = 15.0
     ipw_cap_quantile: float = 0.995
     ipw_cap_high: float = 100.0
     ipw_cap_radr: Optional[float] = None
     adaptive_ipw: bool = True
-    ess_target: float = 0.75
+    ess_target: float = 0.55
 
     # overlap soft-penalty (stabilize propensity logits during training)
     lambda_overlap: float = 0.02
@@ -484,6 +497,12 @@ class IVAPCIV33TheoryConfig:
 
         self.epochs_pretrain = int(min(80, 30 + 10 * np.log1p(n / 500)))
         self.epochs_main = int(min(220, 100 + 15 * np.log1p(n / 500)))
+        if n <= 300:
+            self.ess_target = 0.45
+        elif n <= 1000:
+            self.ess_target = 0.55
+        else:
+            self.ess_target = 0.65
         return self
 
 
@@ -553,6 +572,67 @@ def adaptive_regularization_schedule(
     lambda_h = float(np.clip(lambda_h, 0.005, 0.05))
 
     return gamma_w, gamma_z, lambda_h
+
+
+class SmartAdversarialScheduler:
+    """Warmup + cosine ramp + feedback scheduler for adversarial strengths."""
+
+    def __init__(
+        self,
+        base_gamma_w: float,
+        base_gamma_z: float,
+        warmup_epochs: int = 10,
+        ramp_epochs: int = 30,
+        target_w_auc: float = 0.5,
+        target_z_r2: float = 0.1,
+    ) -> None:
+        self.base_gamma_w = base_gamma_w
+        self.base_gamma_z = base_gamma_z
+        self.warmup = warmup_epochs
+        self.ramp = ramp_epochs
+        self.target_w_auc = target_w_auc
+        self.target_z_r2 = target_z_r2
+
+    def step(self, epoch: int, total_epochs: int, diagnostics: dict) -> tuple[float, float]:
+        import numpy as _np
+
+        if epoch < self.warmup:
+            return 0.0, 0.0
+
+        if epoch < self.warmup + self.ramp:
+            prog = (epoch - self.warmup) / max(1, self.ramp)
+            ramp_factor = 0.5 * (1 - _np.cos(_np.pi * prog))
+        else:
+            ramp_factor = 1.0
+
+        base_w = self.base_gamma_w * ramp_factor
+        base_z = self.base_gamma_z * ramp_factor
+
+        w_auc = float(diagnostics.get("rep_auc_w_to_a", 0.5))
+        z_r2 = float(diagnostics.get("rep_exclusion_leakage_r2", 0.0))
+
+        w_dev = abs(w_auc - self.target_w_auc)
+        if w_dev > 0.15:
+            w_mult = 1.3
+        elif w_dev > 0.08:
+            w_mult = 1.1
+        elif w_dev < 0.05:
+            w_mult = 0.9
+        else:
+            w_mult = 1.0
+
+        if z_r2 > 0.18:
+            z_mult = 1.3
+        elif z_r2 > 0.12:
+            z_mult = 1.1
+        elif z_r2 < 0.08:
+            z_mult = 0.9
+        else:
+            z_mult = 1.0
+
+        gamma_w = float(_np.clip(base_w * w_mult, 0.0, 0.4))
+        gamma_z = float(_np.clip(base_z * z_mult, 0.0, 0.3))
+        return gamma_w, gamma_z
 
 
 # -------------------------
@@ -753,10 +833,15 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         self.adv_w = _AClassifier(cfg.latent_w_dim, cfg.adv_a_hidden).to(self.device)
         self.adv_n = _AClassifier(cfg.latent_n_dim, cfg.adv_a_hidden).to(self.device)
         self.adv_z = _YAdversary(cfg.latent_z_dim, cfg.adv_y_hidden).to(self.device)
-        # conditional adversaries use residualized targets (condition projected out)
-        self.adv_w_cond = _AClassifier(cfg.latent_w_dim, cfg.adv_a_hidden).to(self.device)
-        self.adv_z_cond = _YAdversary(cfg.latent_z_dim, cfg.adv_y_hidden).to(self.device)
-        self.adv_n_cond = _AClassifier(cfg.latent_n_dim, cfg.adv_a_hidden).to(self.device)
+        self.adv_w_cond = TrueConditionalAdversary(cfg.latent_w_dim, cfg.latent_x_dim, cfg.adv_a_hidden).to(
+            self.device
+        )
+        self.adv_z_cond = TrueConditionalAdversary(
+            cfg.latent_z_dim, cfg.latent_x_dim + 1, cfg.adv_y_hidden
+        ).to(self.device)
+        self.adv_n_cond = TrueConditionalAdversary(
+            cfg.latent_n_dim, cfg.latent_x_dim + cfg.latent_w_dim + cfg.latent_z_dim, cfg.adv_a_hidden
+        ).to(self.device)
 
         main_params = (
             list(self.enc_x.parameters())
@@ -880,6 +965,13 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             shuffle=False,
         )
 
+        self._adv_scheduler = SmartAdversarialScheduler(
+            base_gamma_w=cfg.gamma_adv_w,
+            base_gamma_z=cfg.gamma_adv_z,
+            warmup_epochs=cfg.adv_warmup_epochs,
+            ramp_epochs=cfg.adv_ramp_epochs,
+        )
+
         # Stage 0: reconstruction
         for _ in range(cfg.epochs_pretrain):
             self.enc_x.train(); self.enc_w.train(); self.enc_z.train(); self.enc_n.train(); self.decoder.train()
@@ -902,18 +994,18 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             self.adv_w.train(); self.adv_z.train(); self.adv_n.train()
             self.adv_w_cond.train(); self.adv_z_cond.train(); self.adv_n_cond.train()
 
-            gamma_w_ep, gamma_z_ep, lambda_hsic_ep = adaptive_regularization_schedule(
+            _, _, lambda_hsic_ep = adaptive_regularization_schedule(
                 epoch, cfg.epochs_main, getattr(self, "training_diagnostics", {}), cfg
             )
-            adv_factor = 0.0 if epoch < cfg.adv_warmup_epochs else min(
-                1.0, (epoch - cfg.adv_warmup_epochs + 1) / max(1, cfg.adv_ramp_epochs)
+            gamma_w_use, gamma_z_use = self._adv_scheduler.step(
+                epoch, cfg.epochs_main, getattr(self, "training_diagnostics", {})
             )
-            gamma_w_use = gamma_w_ep * adv_factor
-            gamma_z_use = gamma_z_ep * adv_factor
-            gamma_n_use = cfg.gamma_adv_n * adv_factor
-            gamma_w_cond = cfg.gamma_adv_w_cond * adv_factor
-            gamma_z_cond = cfg.gamma_adv_z_cond * adv_factor
-            gamma_n_cond = cfg.gamma_adv_n_cond * adv_factor
+            w_factor = gamma_w_use / max(cfg.gamma_adv_w, 1e-8)
+            z_factor = gamma_z_use / max(cfg.gamma_adv_z, 1e-8)
+            gamma_n_use = cfg.gamma_adv_n * w_factor
+            gamma_w_cond = cfg.gamma_adv_w_cond * w_factor
+            gamma_z_cond = cfg.gamma_adv_z_cond * z_factor
+            gamma_n_cond = cfg.gamma_adv_n_cond * w_factor
 
             epoch_loss = 0.0
             epoch_batches = 0
@@ -923,24 +1015,19 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 yb = yb.to(self.device, dtype=target_dtype)
 
                 # adversaries update (multi-step, conditional)
-                if cfg.adv_steps > 0 and adv_factor > 0:
+                if cfg.adv_steps > 0 and (gamma_w_use > 0 or gamma_z_use > 0 or gamma_n_use > 0):
                     for _ in range(cfg.adv_steps):
                         with torch.no_grad():
                             tx_d, tw_d, tz_d, tn_d = self._encode_blocks(vb)
-                        tw_res = _compute_residual(tw_d, tx_d, ridge=cfg.ridge_alpha)
-                        tz_res = _compute_residual(
-                            tz_d, torch.cat([tx_d, ab.unsqueeze(1)], dim=1), ridge=cfg.ridge_alpha
-                        )
-                        tn_res = _compute_residual(
-                            tn_d, torch.cat([tx_d, tw_d, tz_d], dim=1), ridge=cfg.ridge_alpha
-                        )
                         adv_loss = (
                             bce(self.adv_w(tw_d), ab)
                             + bce(self.adv_n(tn_d), ab)
                             + mse(self.adv_z(tz_d), yb)
-                            + bce(self.adv_w_cond(tw_res), ab)
-                            + mse(self.adv_z_cond(tz_res), yb)
-                            + bce(self.adv_n_cond(tn_res), ab)
+                            + self.adv_w_cond(tw_d, tx_d, ab)
+                            + self.adv_z_cond(tz_d, torch.cat([tx_d, ab.unsqueeze(1)], dim=1), yb)
+                            + self.adv_n_cond(
+                                tn_d, torch.cat([tx_d, tw_d, tz_d], dim=1), ab
+                            )
                         )
                         self.adv_opt.zero_grad(); adv_loss.backward(); self.adv_opt.step()
 
@@ -978,19 +1065,16 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 tx_det = tx.detach()
                 tw_det = tw.detach()
                 tz_det = tz.detach()
-                tw_res = _compute_residual(tw, tx_det, ridge=cfg.ridge_alpha)
-                tz_res = _compute_residual(
-                    tz, torch.cat([tx_det, ab.unsqueeze(1)], dim=1), ridge=cfg.ridge_alpha
-                )
-                tn_res = _compute_residual(
-                    tn, torch.cat([tx_det, tw_det, tz_det], dim=1), ridge=cfg.ridge_alpha
-                )
                 adv_w_logits = self.adv_w(tw)
                 adv_n_logits = self.adv_n(tn)
                 adv_z_pred = self.adv_z(tz)
-                adv_w_cond_logits = self.adv_w_cond(tw_res)
-                adv_z_cond_pred = self.adv_z_cond(tz_res)
-                adv_n_cond_logits = self.adv_n_cond(tn_res)
+                adv_w_cond_loss = self.adv_w_cond(tw, tx_det, ab)
+                adv_z_cond_loss = self.adv_z_cond(
+                    tz, torch.cat([tx_det, ab.unsqueeze(1)], dim=1), yb
+                )
+                adv_n_cond_loss = self.adv_n_cond(
+                    tn, torch.cat([tx_det, tw_det, tz_det], dim=1), ab
+                )
 
                 hsic_pen = torch.zeros((), device=self.device)
                 if lambda_hsic_ep > 0:
@@ -1027,9 +1111,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     - gamma_w_use * bce(adv_w_logits, ab)
                     - gamma_n_use * bce(adv_n_logits, ab)
                     - gamma_z_use * mse(adv_z_pred, yb)
-                    - gamma_w_cond * bce(adv_w_cond_logits, ab)
-                    - gamma_z_cond * mse(adv_z_cond_pred, yb)
-                    - gamma_n_cond * bce(adv_n_cond_logits, ab)
+                    - gamma_w_cond * adv_w_cond_loss
+                    - gamma_z_cond * adv_z_cond_loss
+                    - gamma_n_cond * adv_n_cond_loss
                 )
 
                 self.main_opt.zero_grad(); loss_main.backward(); self.main_opt.step()
