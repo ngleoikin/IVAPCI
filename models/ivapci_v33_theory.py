@@ -1139,6 +1139,16 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     adv_steps_ep += 1
                 adv_steps_ep = int(np.clip(adv_steps_ep, cfg.adv_steps_min, cfg.adv_steps_max))
 
+                # leak-driven strength boost: increase adversarial strength when leakage is high
+                leak_boost = 1.0
+                if w_auc > 0.68:
+                    leak_boost = 1.2
+                elif w_auc > 0.62:
+                    leak_boost = 1.1
+                gamma_w_use *= leak_boost
+                gamma_w_cond *= leak_boost
+                gamma_n_use *= leak_boost
+
             epoch_loss = 0.0
             epoch_batches = 0
             for vb, ab, yb in tr_loader:
@@ -1231,8 +1241,18 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                         + _rbf_hsic(tz_h, tn_h)
                     )
 
+                lambda_overlap_ep = float(cfg.lambda_overlap)
+                if cfg.lambda_overlap > 0:
+                    diag_now = getattr(self, "training_diagnostics", {}) or {}
+                    ess_min = diag_now.get("overlap_ess_min")
+                    ess_target_train = cfg.ess_target_train or 0.0
+                    if ess_min is not None and ess_target_train > 0:
+                        gap = max(0.0, float(ess_target_train) - float(ess_min))
+                        scale = 1.0 + float(cfg.overlap_boost) * gap / max(1e-6, float(ess_target_train))
+                        lambda_overlap_ep = float(np.clip(cfg.lambda_overlap * scale, 0.0, cfg.lambda_overlap * 3.0))
+
                 overlap_pen = torch.zeros((), device=self.device)
-                if cfg.lambda_overlap > 0 and epoch >= cfg.overlap_warmup_epochs:
+                if lambda_overlap_ep > 0 and epoch >= cfg.overlap_warmup_epochs:
                     prob_a = torch.sigmoid(logits_a)
                     m = cfg.overlap_margin
                     overlap_pen = torch.mean(torch.relu(m - prob_a) ** 2 + torch.relu(m - (1 - prob_a)) ** 2)
@@ -1246,7 +1266,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     + cond_weight * cond_ortho
                     + cfg.gamma_padic * _padic_ultrametric_loss(torch.cat([tx, tz], dim=1))
                     + lambda_hsic_ep * hsic_pen
-                    + cfg.lambda_overlap * overlap_pen
+                    + lambda_overlap_ep * overlap_pen
                     - gamma_w_use * bce(adv_w_logits, ab)
                     - gamma_n_use * bce(adv_n_logits, ab)
                     - gamma_z_use * mse(adv_z_pred, yb)
