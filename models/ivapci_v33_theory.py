@@ -683,6 +683,75 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         self.training_diagnostics: Dict[str, float] = {}
         self.info_monitor = InformationLossMonitor()
 
+    def _quick_monitor(self, V_std: np.ndarray, A: np.ndarray, Y_std: np.ndarray, max_n: int) -> Dict[str, float]:
+        """Lightweight in-training diagnostics using existing adversaries (Theorem 5 feedback).
+
+        Returns an EMA-ready dictionary with:
+        - rep_auc_w_to_a: proxy for W→A leakage
+        - rep_exclusion_leakage_r2: proxy for Z→Y leakage
+        - overlap_ess_min: min ESS across treatment arms using current propensity head
+        - info_loss_proxy: reconstruction MSE on the monitor batch
+        """
+
+        n = int(A.shape[0])
+        if n < 8:
+            return {
+                "rep_auc_w_to_a": 0.5,
+                "rep_exclusion_leakage_r2": 0.0,
+                "overlap_ess_min": 0.0,
+                "info_loss_proxy": 0.02,
+            }
+
+        k = int(min(max_n, n))
+        idx = np.random.choice(n, size=k, replace=False)
+        vb = torch.from_numpy(V_std[idx]).to(self.device, dtype=self.dtype)
+        ab = torch.from_numpy(A[idx]).to(self.device, dtype=self.dtype)
+        yb = torch.from_numpy(Y_std[idx]).to(self.device, dtype=self.dtype)
+
+        # switch to eval to avoid dropout influence during monitoring
+        modules = [
+            self.enc_x,
+            self.enc_w,
+            self.enc_z,
+            self.enc_n,
+            self.decoder,
+            self.a_head,
+            self.adv_w,
+            self.adv_z,
+        ]
+        train_states = [m.training for m in modules]
+        for m in modules:
+            m.eval()
+
+        with torch.no_grad():
+            tx, tw, tz, tn = self._encode_blocks(vb)
+            w_logits = self.adv_w(tw).view(-1).cpu().numpy()
+            z_pred = self.adv_z(tz).view(-1).cpu().numpy()
+            e_hat = torch.sigmoid(self.a_head(torch.cat([tx, tz], dim=1))).view(-1).cpu().numpy()
+            recon = self.decoder(torch.cat([tx, tw, tz, tn], dim=1))
+            info_loss = float(torch.mean((recon - vb) ** 2).detach().cpu().item())
+
+        # restore training states
+        for m, state in zip(modules, train_states):
+            m.train(mode=state)
+
+        try:
+            w_auc = float(roc_auc_score(ab.cpu().numpy(), w_logits))
+        except Exception:
+            w_auc = float("nan")
+
+        z_r2 = float(r2_score(yb.cpu().numpy(), z_pred)) if np.var(z_pred) > 0 else float("nan")
+        e_hat = np.clip(e_hat, 1e-6, 1 - 1e-6)
+        ess_t, ess_c = compute_ess_by_group(e_hat, ab.cpu().numpy())
+        ess_min = float(min(ess_t, ess_c))
+
+        return {
+            "rep_auc_w_to_a": w_auc,
+            "rep_exclusion_leakage_r2": z_r2,
+            "overlap_ess_min": ess_min,
+            "info_loss_proxy": info_loss,
+        }
+
     def _split_raw_blocks(self, V_all: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         cfg = self.config
         total = cfg.x_dim + cfg.w_dim + cfg.z_dim
@@ -894,6 +963,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             + list(self.adv_n_cond.parameters())
         )
         self.adv_opt = torch.optim.Adam(adv_params, lr=cfg.lr_adv)
+        self.dtype = next(self.enc_x.parameters()).dtype
 
     def _split_blocks_tensor(
         self, V_t: torch.Tensor
@@ -1016,6 +1086,18 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
 
         # Stage 1: full training
         for epoch in range(cfg.epochs_main):
+            # lightweight diagnostics for adaptive scheduling (EMA-smoothed)
+            if (epoch % max(1, cfg.monitor_every)) == 0:
+                diag_now = self._quick_monitor(V_tr_std, A_tr, Y_tr_std, max_n=cfg.monitor_batch_size)
+                if not hasattr(self, "_diag_ema"):
+                    self._diag_ema = dict(diag_now)
+                else:
+                    ema = float(cfg.monitor_ema)
+                    for k, v in diag_now.items():
+                        prev = self._diag_ema.get(k, v)
+                        self._diag_ema[k] = float(ema * prev + (1.0 - ema) * v)
+                self.training_diagnostics.update(self._diag_ema)
+
             self.enc_x.train(); self.enc_w.train(); self.enc_z.train(); self.enc_n.train()
             self.decoder.train(); self.a_head.train(); self.y_head.train()
             self.a_from_z.train(); self.y_from_w.train()
@@ -1104,9 +1186,9 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     cond_ortho_wz = _conditional_orthogonal_penalty(
                         [tw, tz], tx, ridge=cfg.ridge_alpha
                     )
-                    cond_ortho_n = _conditional_orthogonal_penalty(
-                        [tn], torch.cat([tx, tw, tz], dim=1), ridge=cfg.ridge_alpha
-                    )
+                    tn_cond = torch.cat([tx_det, tw_det, tz_det], dim=1)
+                    tn_res = _compute_residual(tn, tn_cond, ridge=cfg.ridge_alpha)
+                    cond_ortho_n = _offdiag_corr_penalty([tn_res, tx_det, tw_det, tz_det])
                     cond_ortho = cond_ortho_wz + cond_ortho_n
 
                 tx_det = tx.detach()
@@ -1380,12 +1462,16 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             if cfg.propensity_shrinkage > 0:
                 prior = float(np.mean(A_tr)) if len(A_tr) else 0.5
                 e_raw = (1 - cfg.propensity_shrinkage) * e_raw + cfg.propensity_shrinkage * prior
-            min_clip = max(float(cfg.clip_prop), 0.05) if weak_iv else float(cfg.clip_prop)
+            min_clip = float(cfg.clip_prop)
             max_clip = max(min_clip, float(cfg.clip_prop_adaptive_max))
+            ess_target_eff = float(cfg.ess_target)
+            if weak_iv:
+                ess_target_eff = min(ess_target_eff, 0.55)
+                max_clip = min(0.20, max_clip * 1.5)
             clip_use, clip_stats = find_optimal_clip_threshold(
                 e_raw=e_raw,
                 A=A_te,
-                ess_target=float(cfg.ess_target),
+                ess_target=ess_target_eff,
                 min_clip=min_clip,
                 max_clip=max_clip,
                 n_search=20,
@@ -1561,10 +1647,8 @@ class IVAPCIv33TheoryHierRADREstimator(IVAPCIv33TheoryHierEstimator):
         psi = np.zeros_like(Y, dtype=float)
         clip = float(max(cfg.clip_prop_radr, cfg.clip_prop))
         ipw_cap = cfg.ipw_cap_radr if getattr(cfg, "ipw_cap_radr", None) is not None else cfg.ipw_cap
-        if weak_iv:
-            clip = max(clip, 0.05)
-            if ipw_cap is not None:
-                ipw_cap = min(float(ipw_cap), 10.0)
+        if weak_iv and ipw_cap is not None:
+            ipw_cap = min(float(ipw_cap), 10.0)
 
         for tr, te in kf.split(U):
             A_tr, A_te = A[tr], A[te]
