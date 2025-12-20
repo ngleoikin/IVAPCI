@@ -450,11 +450,6 @@ class IVAPCIV33TheoryConfig:
     overlap_margin: float = 0.05
     overlap_warmup_epochs: int = 10
 
-    # overlap soft-penalty (stabilize propensity logits during training)
-    lambda_overlap: float = 0.02
-    overlap_margin: float = 0.05
-    overlap_warmup_epochs: int = 10
-
     seed: int = 42
     device: str = "cpu"
 
