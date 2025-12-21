@@ -457,16 +457,21 @@ def run_one_fit(
     except Exception:
         diag = {}
 
-    w_auc = safe_float(diag.get("rep_auc_w_to_a", np.nan))
-    if not np.isfinite(w_auc):
-        w_auc = 0.5
+    w_auc_raw = safe_float(diag.get("rep_auc_w_to_a", np.nan))
+    if not np.isfinite(w_auc_raw):
+        w_auc_raw = 0.5
+    w_auc_eff = max(float(w_auc_raw), 1.0 - float(w_auc_raw))
+    w_leak = max(0.0, w_auc_eff - 0.5)
+
     z_r2 = safe_float(diag.get("rep_exclusion_leakage_r2", np.nan))
     if not np.isfinite(z_r2):
         z_r2 = 0.0
+    z_leak = max(0.0, float(z_r2))
+
     ess_ratio = _ess_ratio_from_diag(diag, n)
 
-    w_violation = max(0.0, float(w_auc) - float(w_auc_hinge)) ** 2
-    z_violation = max(0.0, float(z_r2) - float(z_r2_hinge)) ** 2
+    w_violation = max(0.0, float(w_auc_eff) - float(w_auc_hinge))
+    z_violation = max(0.0, float(z_r2) - float(z_r2_hinge))
     ess_violation = max(0.0, float(ess_ratio_target) - float(ess_ratio))
 
     return {
@@ -482,8 +487,11 @@ def run_one_fit(
         "rel_abs_err": float(rel_abs_err),
         # legacy alias kept for downstream code
         "ate_err": float(rel_abs_err),
-        "w_auc": float(w_auc),
+        "w_auc": float(w_auc_raw),
+        "w_auc_eff": float(w_auc_eff),
+        "w_leak": float(w_leak),
         "z_r2": float(z_r2),
+        "z_leak": float(z_leak),
         "ess_ratio": float(ess_ratio),
         "w_violation": float(w_violation),
         "z_violation": float(z_violation),
@@ -529,8 +537,11 @@ def aggregate_runs(
                 "w_violation": _agg([r.get("w_violation", np.nan) for r in seed_rows], agg_repeats),
                 "z_violation": _agg([r.get("z_violation", np.nan) for r in seed_rows], agg_repeats),
                 "ess_violation": _agg([r.get("ess_violation", np.nan) for r in seed_rows], agg_repeats),
+                "w_auc_eff": _agg([r.get("w_auc_eff", np.nan) for r in seed_rows], agg_repeats),
+                "w_leak": _agg([r.get("w_leak", np.nan) for r in seed_rows], agg_repeats),
                 "w_auc": _agg([r.get("w_auc", np.nan) for r in seed_rows], agg_repeats),
                 "z_r2": _agg([r.get("z_r2", np.nan) for r in seed_rows], agg_repeats),
+                "z_leak": _agg([r.get("z_leak", np.nan) for r in seed_rows], agg_repeats),
                 "ess_ratio": _agg([r.get("ess_ratio", np.nan) for r in seed_rows], agg_repeats),
                 "train_time": _agg([r.get("train_time", np.nan) for r in seed_rows], agg_repeats),
             })
@@ -544,8 +555,11 @@ def aggregate_runs(
             "w_violation": float(np.nanmean([s["w_violation"] for s in seed_stats])),
             "z_violation": float(np.nanmean([s["z_violation"] for s in seed_stats])),
             "ess_violation": float(np.nanmean([s["ess_violation"] for s in seed_stats])),
+            "w_auc_eff": float(np.nanmean([s["w_auc_eff"] for s in seed_stats])),
+            "w_leak": float(np.nanmean([s["w_leak"] for s in seed_stats])),
             "w_auc": float(np.nanmean([s["w_auc"] for s in seed_stats])),
             "z_r2": float(np.nanmean([s["z_r2"] for s in seed_stats])),
+            "z_leak": float(np.nanmean([s["z_leak"] for s in seed_stats])),
             "ess_ratio": float(np.nanmean([s["ess_ratio"] for s in seed_stats])),
             "train_time": float(np.nanmean([s["train_time"] for s in seed_stats])),
             "n_seeds": len(seed_stats),
@@ -558,8 +572,11 @@ def aggregate_runs(
             "w_violation": float("inf"),
             "z_violation": float("inf"),
             "ess_violation": float("inf"),
+            "w_auc_eff": float("nan"),
+            "w_leak": float("nan"),
             "w_auc": float("nan"),
             "z_r2": float("nan"),
+            "z_leak": float("nan"),
             "ess_ratio": float("nan"),
             "train_time": float("inf"),
         }, []
@@ -576,8 +593,11 @@ def aggregate_runs(
         "w_violation": _wmean("w_violation"),
         "z_violation": _wmean("z_violation"),
         "ess_violation": _wmean("ess_violation"),
+        "w_auc_eff": _wmean("w_auc_eff"),
+        "w_leak": _wmean("w_leak"),
         "w_auc": _wmean("w_auc"),
         "z_r2": _wmean("z_r2"),
+        "z_leak": _wmean("z_leak"),
         "ess_ratio": _wmean("ess_ratio"),
         "train_time": _wmean("train_time"),
     }
@@ -599,18 +619,27 @@ def composite_score_from_scenarios(
     weighted = []
     for s in scenario_stats:
         weight = float(s.get("weight", 1.0))
-        w_auc = float(s.get("w_auc", np.nan))
+        w_auc_eff = float(s.get("w_auc_eff", np.nan))
         z_r2 = float(s.get("z_r2", np.nan))
         ess_ratio = float(s.get("ess_ratio", np.nan))
         ate = float(s.get("rel_abs_err", np.nan))
 
         if not np.isfinite(ate):
             ate = float("inf")
-        w_dev = abs(w_auc - 0.5) if np.isfinite(w_auc) else 0.5
-        z_term = max(0.0, z_r2 - z_r2_hinge) if np.isfinite(z_r2) else 0.5
-        ess_term = max(0.0, ess_ratio_target - ess_ratio) if np.isfinite(ess_ratio) else ess_ratio_target
 
-        loss_s = (1.0 + ate) * (1.0 + 2.0 * w_dev) * (1.0 + 2.0 * z_term) * (1.0 + ess_term)
+        w_term = float(s.get("w_violation", np.nan))
+        if not np.isfinite(w_term):
+            w_term = max(0.0, w_auc_eff - w_auc_hinge) if np.isfinite(w_auc_eff) else 0.5
+
+        z_term = float(s.get("z_violation", np.nan))
+        if not np.isfinite(z_term):
+            z_term = max(0.0, z_r2 - z_r2_hinge) if np.isfinite(z_r2) else 0.5
+
+        ess_term = float(s.get("ess_violation", np.nan))
+        if not np.isfinite(ess_term):
+            ess_term = max(0.0, ess_ratio_target - ess_ratio) if np.isfinite(ess_ratio) else ess_ratio_target
+
+        loss_s = (1.0 + ate) * (1.0 + 2.0 * w_term) * (1.0 + 2.0 * z_term) * (1.0 + ess_term)
         weighted.append((weight, loss_s))
 
     w_sum = float(sum(w for w, _ in weighted))
@@ -765,7 +794,10 @@ def main() -> None:
 
         trial.set_user_attr("mean_ate_err", m["ate_err"])
         trial.set_user_attr("mean_w_auc", m["w_auc"])
+        trial.set_user_attr("mean_w_auc_eff", m.get("w_auc_eff", np.nan))
+        trial.set_user_attr("mean_w_leak", m.get("w_leak", np.nan))
         trial.set_user_attr("mean_z_r2", m["z_r2"])
+        trial.set_user_attr("mean_z_leak", m.get("z_leak", np.nan))
         trial.set_user_attr("mean_ess_ratio", m["ess_ratio"])
         trial.set_user_attr("mean_train_time", m["train_time"])
         trial.set_user_attr("scenario_stats", json.dumps(sc_stats))
@@ -849,7 +881,7 @@ def main() -> None:
             ua = tr.user_attrs
             return {
                 "ate_err": safe_float(ua.get("mean_ate_err", np.nan)),
-                "w_auc": safe_float(ua.get("mean_w_auc", np.nan)),
+                "w_auc_eff": safe_float(ua.get("mean_w_auc_eff", ua.get("mean_w_auc", np.nan))),
                 "z_r2": safe_float(ua.get("mean_z_r2", np.nan)),
                 "ess_ratio": safe_float(ua.get("mean_ess_ratio", np.nan)),
             }
@@ -860,7 +892,7 @@ def main() -> None:
             met = _metric_from_trial(t)
             if (
                 np.isfinite(list(met.values())).all()
-                and met["w_auc"] <= args.w_auc_feasible
+                and met["w_auc_eff"] <= args.w_auc_feasible
                 and met["z_r2"] <= args.z_r2_feasible
                 and met["ess_ratio"] >= args.ess_ratio_feasible
             ):
@@ -882,7 +914,7 @@ def main() -> None:
                         "params": t.params,
                         "user_attrs": dict(t.user_attrs),
                         "metrics": met,
-                        "violation": max(0.0, met["w_auc"] - args.w_auc_feasible)
+                        "violation": max(0.0, met["w_auc_eff"] - args.w_auc_feasible)
                         + max(0.0, met["z_r2"] - args.z_r2_feasible)
                         + max(0.0, args.ess_ratio_feasible - met["ess_ratio"]),
                     }
