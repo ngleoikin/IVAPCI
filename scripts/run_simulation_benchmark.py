@@ -40,6 +40,26 @@ from models.ivapci_v33_theory import (
     IVAPCIv33TheoryHierRADREstimator,
 )
 from models.pacdt_v30 import PACDTv30Estimator
+
+AVAILABLE_METHODS = [
+    "naive",
+    "dr_glm",
+    "dr_rf",
+    "oracle_U",
+    "ivapci_v2_1",
+    "ivapci_v2_1_glm",
+    "ivapci_v2_1_radr",
+    "ivapci_v2_1_pacd_glm",
+    "ivapci_v3_1_pacd",
+    "ivapci_v3_1_radr",
+    "ivapci_v3_1_radr_theory",
+    "ivapci_v3_2_hier",
+    "ivapci_v3_2_hier_radr",
+    "ivapci_v3_3_hier",
+    "ivapci_v3_3_hier_radr",
+    "ivapci_gold",
+    "pacdt_v3_0",
+]
 from simulators.simulators import list_scenarios, simulate_scenario
 
 
@@ -79,6 +99,8 @@ def _build_estimator(
     n_samples: int | None = None,
     seed: int | None = None,
 ):
+    if name not in AVAILABLE_METHODS:
+        raise ValueError(f"Unsupported method '{name}'. Choose from: {sorted(AVAILABLE_METHODS)}")
     if name == "naive":
         return NaiveEstimator()
     if name == "dr_glm":
@@ -230,6 +252,34 @@ def _normalize_scenarios(raw: List[str]) -> List[str]:
     return normalized
 
 
+def _normalize_methods(raw: List[str]) -> List[str]:
+    """Normalize user-specified method names and validate against supported set.
+
+    Supports comma-delimited tokens and catches accidental concatenations by
+    splitting on commas and whitespace. Raises a ``ValueError`` when an
+    unsupported method is requested to avoid silently falling back to the full
+    default list.
+    """
+
+    normalized: List[str] = []
+    seen = set()
+    available_set = set(AVAILABLE_METHODS)
+
+    for token in raw:
+        for part in [p.strip() for p in token.split(",") if p.strip()]:
+            if part not in available_set:
+                raise ValueError(
+                    f"Unsupported method '{part}'. Choose from: {sorted(AVAILABLE_METHODS)}"
+                )
+            if part not in seen:
+                normalized.append(part)
+                seen.add(part)
+
+    if not normalized:
+        raise ValueError("No valid methods provided after normalization.")
+    return normalized
+
+
 def run_benchmark(
     scenarios: List[str],
     n_samples: int,
@@ -369,26 +419,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=[
-            "naive",
-            "dr_glm",
-            "dr_rf",
-            "oracle_U",
-            "ivapci_v2_1",
-            "ivapci_v2_1_glm",
-            "ivapci_v2_1_radr",
-            "ivapci_v2_1_pacd_glm",
-            "ivapci_v3_1_pacd",
-            "ivapci_v3_1_radr",
-            "ivapci_v3_1_radr_theory",
-            "ivapci_v3_2_hier",
-            "ivapci_v3_2_hier_radr",
-            "ivapci_v3_3_hier",
-            "ivapci_v3_3_hier_radr",
-            "ivapci_gold",
-            "pacdt_v3_0",
-        ],
-        help="Causal estimators to evaluate.",
+        default=None,
+        help="Causal estimators to evaluate (space or comma separated).",
+    )
+    parser.add_argument(
+        "--all-methods",
+        action="store_true",
+        help="Run every supported estimator (overrides --methods).",
     )
     parser.add_argument(
         "--variant",
@@ -405,9 +442,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     args.scenarios = _normalize_scenarios(args.scenarios)
+    if args.all_methods and args.methods:
+        raise SystemExit("Specify either --methods or --all-methods, not both.")
+    if args.all_methods:
+        args.methods = list(AVAILABLE_METHODS)
+    elif args.methods:
+        args.methods = _normalize_methods(args.methods)
+    else:
+        raise SystemExit("Please provide --methods <list> or --all-methods to select estimators.")
     outdir = Path(args.outdir) if args.outdir else None
     if outdir:
         outdir.mkdir(parents=True, exist_ok=True)
+    print(f"Running methods: {args.methods}")
     results_path = (
         Path(args.results_path)
         if args.results_path is not None
