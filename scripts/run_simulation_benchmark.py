@@ -236,9 +236,14 @@ def _normalize_scenarios(raw: List[str]) -> List[str]:
                 pos += len(match)
 
             if pos != len(part):
+                guidance = "Ensure scenario names are space- or comma-separated."
+                if "--" in part:
+                    guidance += (
+                        " (did a CLI flag get concatenated? Check missing backslashes"
+                        " on line continuations.)"
+                    )
                 raise ValueError(
-                    f"Unknown scenario '{part}'. Available: {available}. "
-                    "Ensure scenario names are space- or comma-separated."
+                    f"Unknown scenario '{part}'. Available: {available}. {guidance}"
                 )
 
             if matched_any:
