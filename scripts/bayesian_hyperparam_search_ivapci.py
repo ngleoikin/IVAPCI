@@ -131,6 +131,8 @@ def resolve_scenario_generator(module_name: Optional[str], fn_name: Optional[str
         "scripts.simulation_scenarios",
         "simulators",
         "simulators.simulators",
+        "scripts.simulators",
+        "scripts.simulators.simulators",
         "ivapci.simulation_configs",
         "ivapci.simulation_scenarios",
     ]
@@ -218,31 +220,44 @@ def normalize_scenarios_arg(s: str, gen_module_name: str) -> List[str]:
 def extract_data_and_dims(out: Any) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, int, int, int]:
     """
     支持：
-      - dict: {V,A,Y,tau_true,x_dim,w_dim,z_dim}
-      - dict: {X,W,Z,A,Y,tau_true}
-      - tuple: (V,A,Y,tau_true,meta)  meta含 x_dim/w_dim/z_dim 或 X/W/Z
-      - tuple: (X,W,Z,A,Y,tau_true)
+      - dict: {V,A,Y,tau_true|tau,x_dim,w_dim,z_dim}
+      - dict: {X,W,Z,A,Y,tau_true|tau}
+      - tuple: (V,A,Y,tau_true|tau,meta)  meta含 x_dim/w_dim/z_dim 或 X/W/Z
+      - tuple: (X,W,Z,A,Y,tau_true|tau)
+
+    兼容 simulators.simulators 的返回（使用 ``tau`` 键且 meta 不含 x_dim/w_dim/z_dim）。
     """
+
+    def _get_tau(payload: dict) -> float:
+        if "tau_true" in payload:
+            return float(payload["tau_true"])
+        if "tau" in payload:
+            return float(payload["tau"])
+        raise ValueError("Scenario output missing tau/tau_true")
+
     if isinstance(out, dict):
-        if {"V", "A", "Y", "tau_true"}.issubset(out.keys()):
+        # Already concatenated V
+        if {"V", "A", "Y"}.issubset(out.keys()) and ({"tau_true"}.issubset(out.keys()) or {"tau"}.issubset(out.keys())):
             V = np.asarray(out["V"])
             A = np.asarray(out["A"]).reshape(-1)
             Y = np.asarray(out["Y"]).reshape(-1)
-            tau = float(out["tau_true"])
+            tau = _get_tau(out)
             if {"x_dim", "w_dim", "z_dim"}.issubset(out.keys()):
                 return V, A, Y, tau, int(out["x_dim"]), int(out["w_dim"]), int(out["z_dim"])
             meta = out.get("meta", None)
             if isinstance(meta, dict) and {"x_dim", "w_dim", "z_dim"}.issubset(meta.keys()):
                 return V, A, Y, tau, int(meta["x_dim"]), int(meta["w_dim"]), int(meta["z_dim"])
-            raise ValueError("Scenario dict has V/A/Y/tau_true but missing x_dim/w_dim/z_dim.")
-        if {"X", "W", "Z", "A", "Y", "tau_true"}.issubset(out.keys()):
+            raise ValueError("Scenario dict has V/A/Y but missing x_dim/w_dim/z_dim metadata.")
+
+        # Separate X/W/Z
+        if {"X", "W", "Z", "A", "Y"}.issubset(out.keys()) and ({"tau_true"}.issubset(out.keys()) or {"tau"}.issubset(out.keys())):
             X = np.asarray(out["X"])
             W = np.asarray(out["W"])
             Z = np.asarray(out["Z"])
             V = np.concatenate([X, W, Z], axis=1)
             A = np.asarray(out["A"]).reshape(-1)
             Y = np.asarray(out["Y"]).reshape(-1)
-            tau = float(out["tau_true"])
+            tau = _get_tau(out)
             return V, A, Y, tau, X.shape[1], W.shape[1], Z.shape[1]
         raise ValueError(f"Scenario dict keys not recognized: {sorted(out.keys())[:20]}")
 
