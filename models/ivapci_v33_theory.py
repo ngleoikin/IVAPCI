@@ -424,19 +424,19 @@ class IVAPCIV33TheoryConfig:
     gamma_adv_n_cond: float = 0.08
 
     # optional independence penalty
-    lambda_hsic: float = 0.015
+    lambda_hsic: float = 0.10
     hsic_max_samples: int = 256
 
     lambda_recon: float = 1.0
     lambda_a: float = 0.1
     lambda_y: float = 0.5
-    lambda_ortho: float = 0.01
+    lambda_ortho: float = 0.05
     lambda_cond_ortho: float = 1e-3
     lambda_consistency: float = 0.08
     ridge_alpha: float = 1e-2
     standardize_nuisance: bool = True
-    gamma_adv_w: float = 0.15
-    gamma_adv_z: float = 0.12
+    gamma_adv_w: float = 2.0
+    gamma_adv_z: float = 1.5
     gamma_adv_n: float = 0.1
     adv_steps: int = 3
     # Multi-step adversary updates (Theorem 3B/5 practical stabilization)
@@ -506,14 +506,18 @@ class IVAPCIV33TheoryConfig:
         self.latent_z_dim = max(2, base // 6)
         self.latent_n_dim = max(2, base // 3)
 
-        self.lambda_ortho = 0.005 * np.sqrt(np.log1p(n))
+        ortho_scale = 0.005 * np.sqrt(np.log1p(n))
+        self.lambda_ortho = float(max(self.lambda_ortho, ortho_scale))
         self.lambda_consistency = 0.04 * np.sqrt(np.log1p(n))
 
         decay = 1.0 / np.sqrt(np.log1p(n))
         scale_decay = min(1.0, 1.5 * decay)
-        self.gamma_adv_w = 0.15 * scale_decay
-        self.gamma_adv_z = 0.12 * scale_decay
-        self.gamma_adv_n = 0.10 * scale_decay
+        base_gamma_w = getattr(self, "gamma_adv_w", 2.0)
+        base_gamma_z = getattr(self, "gamma_adv_z", 1.5)
+        base_gamma_n = getattr(self, "gamma_adv_n", 0.1)
+        self.gamma_adv_w = float(max(0.5, base_gamma_w * scale_decay))
+        self.gamma_adv_z = float(max(0.5, base_gamma_z * scale_decay))
+        self.gamma_adv_n = float(max(0.05, base_gamma_n * scale_decay))
 
         self.gamma_padic = 0.001 * np.sqrt(np.log1p(n))
         self.min_std = max(1e-4, 1e-2 / np.sqrt(np.log1p(n)))
@@ -604,7 +608,7 @@ def adaptive_regularization_schedule(
 
     gamma_w = float(np.clip(gamma_w, 0.05, 0.4))
     gamma_z = float(np.clip(gamma_z, 0.05, 0.3))
-    lambda_h = float(np.clip(lambda_h, 0.005, 0.05))
+    lambda_h = float(np.clip(lambda_h, 0.005, 0.10))
 
     return gamma_w, gamma_z, lambda_h
 
