@@ -449,7 +449,8 @@ def run_one_fit(
     ate_hat = safe_float(est.estimate_ate(V, A, Y))
     tau_true_f = float(tau_true)
     y_scale_val = _y_scale(Y, tau_true_f, ate_scale)
-    ate_err = abs(ate_hat - tau_true_f) / y_scale_val
+    abs_err = abs(ate_hat - tau_true_f)
+    rel_abs_err = abs_err / (abs(tau_true_f) + y_scale_val)
 
     try:
         diag = est.get_training_diagnostics()
@@ -477,7 +478,10 @@ def run_one_fit(
         "ate_hat": float(ate_hat),
         "tau_true": tau_true_f,
         "y_scale": y_scale_val,
-        "ate_err": float(ate_err),
+        "abs_err": float(abs_err),
+        "rel_abs_err": float(rel_abs_err),
+        # legacy alias kept for downstream code
+        "ate_err": float(rel_abs_err),
         "w_auc": float(w_auc),
         "z_r2": float(z_r2),
         "ess_ratio": float(ess_ratio),
@@ -500,8 +504,15 @@ def _agg(values: List[float], method: str) -> float:
     return float(np.nanmedian(arr))
 
 
-def aggregate_runs(runs: List[Dict[str, Any]], *, scenarios: List[str], agg_repeats: str) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
-    """Aggregate metrics with repeat-level robustness, then seeds, then scenarios."""
+def aggregate_runs(
+    runs: List[Dict[str, Any]], *, scenarios: List[str], agg_repeats: str
+) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
+    """Aggregate metrics with repeat-level robustness → seeds → scenarios.
+
+    Repeat-level aggregation uses ``agg_repeats`` (median/mean) within each base seed
+    so ``n_repeats`` truly stabilizes noisy training. Scenario-level aggregation uses
+    a weighted mean across seeds (weight = log1p(n_seeds)) and across scenarios.
+    """
 
     scenario_stats: List[Dict[str, Any]] = []
     for sc in scenarios:
@@ -513,6 +524,7 @@ def aggregate_runs(runs: List[Dict[str, Any]], *, scenarios: List[str], agg_repe
         for bs in base_seeds:
             seed_rows = [r for r in sc_rows if int(r.get("base_seed", -1)) == bs]
             seed_stats.append({
+                "rel_abs_err": _agg([r.get("rel_abs_err", np.nan) for r in seed_rows], agg_repeats),
                 "ate_err": _agg([r.get("ate_err", np.nan) for r in seed_rows], agg_repeats),
                 "w_violation": _agg([r.get("w_violation", np.nan) for r in seed_rows], agg_repeats),
                 "z_violation": _agg([r.get("z_violation", np.nan) for r in seed_rows], agg_repeats),
@@ -523,9 +535,11 @@ def aggregate_runs(runs: List[Dict[str, Any]], *, scenarios: List[str], agg_repe
                 "train_time": _agg([r.get("train_time", np.nan) for r in seed_rows], agg_repeats),
             })
 
-        # mean across seeds within scenario
+        weight = float(np.log1p(len(seed_stats))) if seed_stats else 1.0
         scenario_stats.append({
             "scenario": sc,
+            "weight": weight,
+            "rel_abs_err": float(np.nanmean([s["rel_abs_err"] for s in seed_stats])),
             "ate_err": float(np.nanmean([s["ate_err"] for s in seed_stats])),
             "w_violation": float(np.nanmean([s["w_violation"] for s in seed_stats])),
             "z_violation": float(np.nanmean([s["z_violation"] for s in seed_stats])),
@@ -534,10 +548,12 @@ def aggregate_runs(runs: List[Dict[str, Any]], *, scenarios: List[str], agg_repe
             "z_r2": float(np.nanmean([s["z_r2"] for s in seed_stats])),
             "ess_ratio": float(np.nanmean([s["ess_ratio"] for s in seed_stats])),
             "train_time": float(np.nanmean([s["train_time"] for s in seed_stats])),
+            "n_seeds": len(seed_stats),
         })
 
     if not scenario_stats:
         return {
+            "rel_abs_err": float("inf"),
             "ate_err": float("inf"),
             "w_violation": float("inf"),
             "z_violation": float("inf"),
@@ -548,28 +564,59 @@ def aggregate_runs(runs: List[Dict[str, Any]], *, scenarios: List[str], agg_repe
             "train_time": float("inf"),
         }, []
 
+    w_sum = float(sum(s.get("weight", 1.0) for s in scenario_stats))
+    def _wmean(key: str) -> float:
+        return float(
+            sum((s.get("weight", 1.0) * s.get(key, np.nan)) for s in scenario_stats) / max(w_sum, 1e-8)
+        )
+
     global_stats = {
-        "ate_err": float(np.nanmean([s["ate_err"] for s in scenario_stats])),
-        "w_violation": float(np.nanmean([s["w_violation"] for s in scenario_stats])),
-        "z_violation": float(np.nanmean([s["z_violation"] for s in scenario_stats])),
-        "ess_violation": float(np.nanmean([s["ess_violation"] for s in scenario_stats])),
-        "w_auc": float(np.nanmean([s["w_auc"] for s in scenario_stats])),
-        "z_r2": float(np.nanmean([s["z_r2"] for s in scenario_stats])),
-        "ess_ratio": float(np.nanmean([s["ess_ratio"] for s in scenario_stats])),
-        "train_time": float(np.nanmean([s["train_time"] for s in scenario_stats])),
+        "rel_abs_err": _wmean("rel_abs_err"),
+        "ate_err": _wmean("ate_err"),
+        "w_violation": _wmean("w_violation"),
+        "z_violation": _wmean("z_violation"),
+        "ess_violation": _wmean("ess_violation"),
+        "w_auc": _wmean("w_auc"),
+        "z_r2": _wmean("z_r2"),
+        "ess_ratio": _wmean("ess_ratio"),
+        "train_time": _wmean("train_time"),
     }
     return global_stats, scenario_stats
 
 
-def composite_score(m: Dict[str, float]) -> float:
-    """Single-objective score: hinge penalties with interpretable weights."""
+def composite_score_from_scenarios(
+    scenario_stats: List[Dict[str, Any]], *, w_auc_hinge: float, z_r2_hinge: float, ess_ratio_target: float
+) -> float:
+    """Multiplicative objective that penalizes any violated condition.
 
-    return float(
-        3.0 * m["ate_err"]
-        + 2.0 * m["w_violation"]
-        + 2.0 * m["z_violation"]
-        + 1.0 * m["ess_violation"]
-    )
+    L_s = (1 + L_ate) * (1 + 2*L_w) * (1 + 2*L_z) * (1 + L_ess)
+    Global = Σ_s w_s * L_s / Σ_s w_s, with w_s = log1p(n_seeds).
+    """
+
+    if not scenario_stats:
+        return float("inf")
+
+    weighted = []
+    for s in scenario_stats:
+        weight = float(s.get("weight", 1.0))
+        w_auc = float(s.get("w_auc", np.nan))
+        z_r2 = float(s.get("z_r2", np.nan))
+        ess_ratio = float(s.get("ess_ratio", np.nan))
+        ate = float(s.get("rel_abs_err", np.nan))
+
+        if not np.isfinite(ate):
+            ate = float("inf")
+        w_dev = abs(w_auc - 0.5) if np.isfinite(w_auc) else 0.5
+        z_term = max(0.0, z_r2 - z_r2_hinge) if np.isfinite(z_r2) else 0.5
+        ess_term = max(0.0, ess_ratio_target - ess_ratio) if np.isfinite(ess_ratio) else ess_ratio_target
+
+        loss_s = (1.0 + ate) * (1.0 + 2.0 * w_dev) * (1.0 + 2.0 * z_term) * (1.0 + ess_term)
+        weighted.append((weight, loss_s))
+
+    w_sum = float(sum(w for w, _ in weighted))
+    if w_sum <= 0:
+        return float("inf")
+    return float(sum(w * l for w, l in weighted) / w_sum)
 
 
 # -------------------- 主程序 --------------------
@@ -693,8 +740,13 @@ def main() -> None:
                         all_rows.append(r)
 
                         if objective_mode == "single" and not isinstance(pruner, optuna.pruners.NopPruner):
-                            m, _ = aggregate_runs(all_rows, scenarios=scenarios, agg_repeats=args.agg)
-                            score = composite_score(m)
+                            _, sc_stats = aggregate_runs(all_rows, scenarios=scenarios, agg_repeats=args.agg)
+                            score = composite_score_from_scenarios(
+                                sc_stats,
+                                w_auc_hinge=args.w_auc_hinge,
+                                z_r2_hinge=args.z_r2_hinge,
+                                ess_ratio_target=args.ess_ratio_target,
+                            )
                             trial.report(score, step=step)
                             step += 1
                             if trial.should_prune():
@@ -726,7 +778,12 @@ def main() -> None:
                 m["ess_violation"],
             )
 
-        return composite_score(m)
+        return composite_score_from_scenarios(
+            sc_stats,
+            w_auc_hinge=args.w_auc_hinge,
+            z_r2_hinge=args.z_r2_hinge,
+            ess_ratio_target=args.ess_ratio_target,
+        )
 
     timeout = args.timeout_hours * 3600 if args.timeout_hours else None
 
@@ -762,7 +819,14 @@ def main() -> None:
         show_progress_bar=(not args.quiet),
     )
 
-    df = study.trials_dataframe(attrs=("number", "value", "params", "user_attrs", "state"))
+    attr_cols = ("number", "values", "params", "user_attrs", "state") if objective_mode == "pareto" else (
+        "number",
+        "value",
+        "params",
+        "user_attrs",
+        "state",
+    )
+    df = study.trials_dataframe(attrs=attr_cols)
     df.to_csv(outdir / "trials.csv", index=False)
 
     if objective_mode == "pareto":
