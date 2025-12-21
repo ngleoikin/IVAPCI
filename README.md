@@ -96,11 +96,12 @@ python scripts/run_hyperparam_search.py \
 **依赖**：`pip install optuna`（可选：`optuna-dashboard plotly kaleido` 用于可视化）
 
 **核心特性**
-- Optuna TPE（默认）或 NSGA-II（多目标）采样
-- 单目标：综合 `RMSE + |W_AUC-0.5| + Z泄露 + ESS` 罚项（可按需改权重）
-- 多目标：`--multiobjective` 优化 `(RMSE, |W_AUC-0.5|, Z泄露)` 帕累托前沿
-- 按场景×种子×重复评估，每个 trial 支持剪枝（pruning）
-- 输出：`trials.csv`、`optuna_study.db`、`best_params.json`（单目标）或帕累托 JSON（多目标）
+- Optuna TPE（默认）或 NSGA-II（帕累托）采样，仓库根目录自动加入 `sys.path`
+- 单目标：`score = 3·ATE_err + 2·W_violation + 2·Z_violation + ESS_violation`（hinge 惩罚，ATE 可选 y_std/y_mad/tau_abs 归一化）
+- 多目标：`--objective-mode pareto`（或 `--multiobjective`）直接最小化 `(ATE_err, W_violation, Z_violation, ESS_violation)`
+- 诊断阈值可调：`--w-auc-thr`（默认0.55）、`--z-r2-thr`（默认0.05/0.08）、`--ess-ratio-target`（默认0.40）
+- 按场景×种子×重复稳健聚合（重复层可选 `--agg median|mean`），并把关键指标写入 trial `user_attrs`
+- 输出：`trials.csv`、`optuna_study.db`、`best_params.json`（单目标）或帕累托/可行集/推荐解 JSON（多目标）
 
 **最小示例（单目标 TPE）**
 ```bash
@@ -113,14 +114,11 @@ python scripts/bayesian_hyperparam_search_ivapci.py \
   --output-dir outputs/optuna_quick
 ```
 
-**常用开关**
-- `--mode {quick,balanced,focused_w}`：选择采样空间范围
-- `--multiobjective`：启用帕累托优化（NSGA-II 更合适）
-- `--sampler {tpe,nsga2}` / `--pruner {median,hyperband,none}`：采样与剪枝策略
-- `--n-trials / --n-jobs / --timeout-hours`：控制搜索规模与并行
-- 同样支持 `--estimator`、`--scenario-module`、`--scenario-fn` 覆盖
-- `--scenarios`：推荐用 **逗号** 或带引号的空格分隔防止 CLI 解析错误
-- 模型导入：脚本会自动把仓库根目录加入 `sys.path` 并尝试 `models.ivapci_v33_theory*`，如仍失败可显式指定 `--estimator-module models.ivapci_v33_theory`
+- **模式/目标**：`--objective-mode {pareto,single}`（默认 pareto）；`--mode {quick,balanced,focused_w}` 选择采样空间
+- **阈值**：`--w-auc-thr`、`--z-r2-thr`、`--ess-ratio-target` 调整理论约束；`--ate-scale {y_std,y_mad,tau_abs}` 控制 ATE 归一化
+- **搜索控制**：`--sampler {tpe,nsga2}`，`--pruner {median,hyperband,none}`（帕累托自动禁用剪枝），`--n-trials / --n-jobs / --timeout-hours`
+- **数据/模型**：`--estimator`、`--scenario-module`、`--scenario-fn`、`--scenarios`（用逗号或带引号的空格分隔）
+- **其他**：`--agg` 设定重复层聚合（默认 median），`--output-dir`/`--study-name` 控制输出
 
 **结果查看**
 - 单目标：`best_params.json` 给出最佳 trial；`trials.csv` 可用 pandas/Excel 分析；`optuna-dashboard sqlite:///outputs/optuna_quick/optuna_study.db` 可实时查看进度

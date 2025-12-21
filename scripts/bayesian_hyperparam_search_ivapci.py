@@ -73,6 +73,14 @@ def safe_float(x: Any) -> float:
         return float("nan")
 
 
+def median_abs_deviation(arr: np.ndarray) -> float:
+    arr = np.asarray(arr, dtype=float)
+    if arr.size == 0:
+        return float("nan")
+    med = np.median(arr)
+    return float(np.median(np.abs(arr - med)))
+
+
 # -------------------- 自动探测：estimator module --------------------
 
 def try_import_first(candidates: Sequence[str]) -> Tuple[str, Any]:
@@ -364,6 +372,30 @@ def make_seed(base_seed: int, trial_num: int, scenario: str, repeat: int) -> int
     ) % (2**31 - 1)
 
 
+def _ess_ratio_from_diag(diag: Dict[str, Any], n: int) -> float:
+    ess = safe_float(diag.get("overlap_ess_min", np.nan))
+    if not np.isfinite(ess):
+        ess = safe_float(diag.get("dr_ess_min", np.nan))
+        if np.isfinite(ess) and n > 0 and ess > 1.0:
+            ess = ess / float(n)
+    if not np.isfinite(ess):
+        ess = 0.0
+    return float(ess)
+
+
+def _y_scale(Y: np.ndarray, tau_true: float, mode: str) -> float:
+    y = np.asarray(Y, dtype=float)
+    if mode == "y_mad":
+        scale = median_abs_deviation(y)
+    elif mode == "tau_abs":
+        scale = abs(float(tau_true))
+    else:
+        scale = float(np.std(y))
+    if not np.isfinite(scale) or scale <= 0:
+        scale = float(np.std(y) + 1e-8)
+    return float(scale + 1e-8)
+
+
 def run_one_fit(
     est_mod: Any,
     estimator_kind: str,
@@ -374,8 +406,14 @@ def run_one_fit(
     seed: int,
     epochs_main: int,
     pretrain_epochs: Optional[int],
+    *,
+    w_auc_thr: float,
+    z_r2_thr: float,
+    ess_ratio_target: float,
+    ate_scale: str,
 ) -> Dict[str, Any]:
-    # resolve classes
+    """Simulate, fit, and return diagnostics plus per-run objective components."""
+
     Cfg = getattr(est_mod, "IVAPCIV33TheoryConfig", None)
     if Cfg is None:
         raise AttributeError("Estimator module missing IVAPCIV33TheoryConfig")
@@ -396,7 +434,6 @@ def run_one_fit(
     if pretrain_epochs is not None:
         cfg.epochs_pretrain = int(pretrain_epochs)
 
-    # apply overrides
     for k, v in cfg_overrides.items():
         setattr(cfg, k, parse_hidden_spec(v))
 
@@ -406,71 +443,127 @@ def run_one_fit(
     train_time = time.time() - t0
 
     ate_hat = safe_float(est.estimate_ate(V, A, Y))
-    err = ate_hat - float(tau_true)
+    tau_true_f = float(tau_true)
+    y_scale_val = _y_scale(Y, tau_true_f, ate_scale)
+    ate_err = abs(ate_hat - tau_true_f) / y_scale_val
 
     try:
         diag = est.get_training_diagnostics()
     except Exception:
         diag = {}
 
+    w_auc = safe_float(diag.get("rep_auc_w_to_a", np.nan))
+    if not np.isfinite(w_auc):
+        w_auc = 0.5
+    z_r2 = safe_float(diag.get("rep_exclusion_leakage_r2", np.nan))
+    if not np.isfinite(z_r2):
+        z_r2 = 0.0
+    ess_ratio = _ess_ratio_from_diag(diag, n)
+
+    w_violation = max(0.0, float(w_auc) - float(w_auc_thr)) ** 2
+    z_violation = max(0.0, float(z_r2) - float(z_r2_thr)) ** 2
+    ess_violation = max(0.0, float(ess_ratio_target) - float(ess_ratio))
+
     return {
         "status": "success",
         "scenario": scenario_name,
         "seed": int(seed),
-        "true_ate": float(tau_true),
-        "ate_est": float(ate_hat),
-        "sq_err": float(err * err),
+        "ate_hat": float(ate_hat),
+        "tau_true": tau_true_f,
+        "y_scale": y_scale_val,
+        "ate_err": float(ate_err),
+        "w_auc": float(w_auc),
+        "z_r2": float(z_r2),
+        "ess_ratio": float(ess_ratio),
+        "w_violation": float(w_violation),
+        "z_violation": float(z_violation),
+        "ess_violation": float(ess_violation),
         "train_time": float(train_time),
-        "rep_auc_w_to_a": safe_float(diag.get("rep_auc_w_to_a", np.nan)),
-        "rep_exclusion_leakage_r2": safe_float(diag.get("rep_exclusion_leakage_r2", np.nan)),
-        "overlap_ess_min": safe_float(diag.get("overlap_ess_min", np.nan)),
         "iv_first_stage_f": safe_float(diag.get("iv_first_stage_f", np.nan)),
         "weak_iv_flag": safe_float(diag.get("weak_iv_flag", np.nan)),
     }
 
 
-def aggregate_metrics(rows: List[Dict[str, Any]]) -> Dict[str, float]:
-    ok = [r for r in rows if r.get("status") == "success"]
-    if not ok:
+def _agg(values: List[float], method: str) -> float:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    if method == "mean":
+        return float(np.nanmean(arr))
+    return float(np.nanmedian(arr))
+
+
+def aggregate_runs(runs: List[Dict[str, Any]], *, scenarios: List[str], agg_repeats: str) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
+    """Aggregate metrics with repeat-level robustness, then seeds, then scenarios."""
+
+    scenario_stats: List[Dict[str, Any]] = []
+    for sc in scenarios:
+        sc_rows = [r for r in runs if r.get("scenario") == sc and r.get("status") == "success"]
+        if not sc_rows:
+            continue
+        seeds = sorted(set(int(r.get("seed", 0)) for r in sc_rows))
+        seed_stats: List[Dict[str, float]] = []
+        for seed in seeds:
+            seed_rows = [r for r in sc_rows if int(r.get("seed", 0)) == seed]
+            seed_stats.append({
+                "ate_err": _agg([r.get("ate_err", np.nan) for r in seed_rows], agg_repeats),
+                "w_violation": _agg([r.get("w_violation", np.nan) for r in seed_rows], agg_repeats),
+                "z_violation": _agg([r.get("z_violation", np.nan) for r in seed_rows], agg_repeats),
+                "ess_violation": _agg([r.get("ess_violation", np.nan) for r in seed_rows], agg_repeats),
+                "w_auc": _agg([r.get("w_auc", np.nan) for r in seed_rows], agg_repeats),
+                "z_r2": _agg([r.get("z_r2", np.nan) for r in seed_rows], agg_repeats),
+                "ess_ratio": _agg([r.get("ess_ratio", np.nan) for r in seed_rows], agg_repeats),
+                "train_time": _agg([r.get("train_time", np.nan) for r in seed_rows], agg_repeats),
+            })
+
+        # mean across seeds within scenario
+        scenario_stats.append({
+            "scenario": sc,
+            "ate_err": float(np.nanmean([s["ate_err"] for s in seed_stats])),
+            "w_violation": float(np.nanmean([s["w_violation"] for s in seed_stats])),
+            "z_violation": float(np.nanmean([s["z_violation"] for s in seed_stats])),
+            "ess_violation": float(np.nanmean([s["ess_violation"] for s in seed_stats])),
+            "w_auc": float(np.nanmean([s["w_auc"] for s in seed_stats])),
+            "z_r2": float(np.nanmean([s["z_r2"] for s in seed_stats])),
+            "ess_ratio": float(np.nanmean([s["ess_ratio"] for s in seed_stats])),
+            "train_time": float(np.nanmean([s["train_time"] for s in seed_stats])),
+        })
+
+    if not scenario_stats:
         return {
-            "mean_rmse": float("inf"),
-            "mean_w_auc": float("nan"),
-            "mean_z_leak": float("nan"),
-            "mean_overlap_ess_min": float("nan"),
-            "mean_train_time": float("inf"),
-        }
-    rmse = float(np.sqrt(np.mean([r["sq_err"] for r in ok])))
-    w_auc = float(np.nanmean([r["rep_auc_w_to_a"] for r in ok]))
-    z_leak = float(np.nanmean([r["rep_exclusion_leakage_r2"] for r in ok]))
-    ess = float(np.nanmean([r["overlap_ess_min"] for r in ok]))
-    tt = float(np.mean([r["train_time"] for r in ok]))
-    return {
-        "mean_rmse": rmse,
-        "mean_w_auc": w_auc,
-        "mean_z_leak": z_leak,
-        "mean_overlap_ess_min": ess,
-        "mean_train_time": tt,
+            "ate_err": float("inf"),
+            "w_violation": float("inf"),
+            "z_violation": float("inf"),
+            "ess_violation": float("inf"),
+            "w_auc": float("nan"),
+            "z_r2": float("nan"),
+            "ess_ratio": float("nan"),
+            "train_time": float("inf"),
+        }, []
+
+    global_stats = {
+        "ate_err": float(np.nanmean([s["ate_err"] for s in scenario_stats])),
+        "w_violation": float(np.nanmean([s["w_violation"] for s in scenario_stats])),
+        "z_violation": float(np.nanmean([s["z_violation"] for s in scenario_stats])),
+        "ess_violation": float(np.nanmean([s["ess_violation"] for s in scenario_stats])),
+        "w_auc": float(np.nanmean([s["w_auc"] for s in scenario_stats])),
+        "z_r2": float(np.nanmean([s["z_r2"] for s in scenario_stats])),
+        "ess_ratio": float(np.nanmean([s["ess_ratio"] for s in scenario_stats])),
+        "train_time": float(np.nanmean([s["train_time"] for s in scenario_stats])),
     }
+    return global_stats, scenario_stats
 
 
 def composite_score(m: Dict[str, float]) -> float:
-    """
-    单目标：越小越好。
-    这里不做全局 min-max（Optuna 运行中拿不到全局信息），用“可解释的罚项”：
-      score = RMSE
-            + 0.6 * |W_AUC-0.5|
-            + 1.2 * max(0, Z_leak-0.10)
-            + 0.2 * max(0, 0.20-ESSmin)   # ESS 太低时惩罚
-    你可以按经验调整权重/阈值。
-    """
-    rmse = m["mean_rmse"]
-    w_dev = abs(m["mean_w_auc"] - 0.5) if np.isfinite(m["mean_w_auc"]) else 0.25
-    z = m["mean_z_leak"]
-    ess = m["mean_overlap_ess_min"]
+    """Single-objective score: hinge penalties with interpretable weights."""
 
-    z_pen = max(0.0, (z - 0.10)) if np.isfinite(z) else 0.2
-    ess_pen = max(0.0, (0.20 - ess)) if np.isfinite(ess) else 0.2
-    return float(rmse + 0.6 * w_dev + 1.2 * z_pen + 0.2 * ess_pen)
+    return float(
+        3.0 * m["ate_err"]
+        + 2.0 * m["w_violation"]
+        + 2.0 * m["z_violation"]
+        + 1.0 * m["ess_violation"]
+    )
 
 
 # -------------------- 主程序 --------------------
@@ -496,12 +589,21 @@ def main() -> None:
 
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--study-name", type=str, default=None)
-    parser.add_argument("--multiobjective", action="store_true", help="optimize (rmse, |w_auc-0.5|, z_leak) pareto front")
+    parser.add_argument("--multiobjective", action="store_true", help="(deprecated) same as --objective-mode pareto")
+    parser.add_argument("--objective-mode", choices=["single", "pareto"], default="pareto")
     parser.add_argument("--sampler", choices=["tpe", "nsga2"], default="tpe")
     parser.add_argument("--pruner", choices=["median", "hyperband", "none"], default="median")
+    parser.add_argument("--agg", choices=["median", "mean"], default="median", help="repeat-level aggregation")
+    parser.add_argument("--w-auc-thr", type=float, default=0.55, help="W→A AUC upper bound for violation hinge")
+    parser.add_argument("--z-r2-thr", type=float, default=0.05, help="Z→Y leakage R2 upper bound for violation hinge")
+    parser.add_argument("--ess-ratio-target", type=float, default=0.40, help="Minimum ESS ratio target")
+    parser.add_argument("--ate-scale", choices=["y_std", "y_mad", "tau_abs"], default="y_std", help="normalize ATE error")
     parser.add_argument("--quiet", action="store_true")
 
     args = parser.parse_args()
+
+    if args.multiobjective:
+        args.objective_mode = "pareto"
 
     est_mod = resolve_estimator_module(args.estimator_module)
     gen_mod_name, gen_fn_name, scenario_fn = resolve_scenario_generator(args.scenario_module, args.scenario_fn)
@@ -516,6 +618,11 @@ def main() -> None:
     study_name = args.study_name or f"ivapci_{args.mode}_{ts}"
     storage = f"sqlite:///{outdir}/optuna_study.db"
 
+    objective_mode = args.objective_mode
+    if objective_mode == "pareto" and args.sampler == "tpe":
+        # NSGA-II is more appropriate for Pareto fronts.
+        args.sampler = "nsga2"
+
     # sampler
     if args.sampler == "tpe":
         sampler: optuna.samplers.BaseSampler = optuna.samplers.TPESampler(
@@ -527,14 +634,16 @@ def main() -> None:
         sampler = optuna.samplers.NSGAIISampler(seed=42)
 
     # pruner
-    if args.pruner == "median":
-        pruner: optuna.pruners.BasePruner = optuna.pruners.MedianPruner(n_startup_trials=8, n_warmup_steps=0)
+    if objective_mode == "pareto":
+        pruner: optuna.pruners.BasePruner = optuna.pruners.NopPruner()
+    elif args.pruner == "median":
+        pruner = optuna.pruners.MedianPruner(n_startup_trials=8, n_warmup_steps=0)
     elif args.pruner == "hyperband":
         pruner = optuna.pruners.HyperbandPruner()
     else:
         pruner = optuna.pruners.NopPruner()
 
-    directions = ["minimize", "minimize", "minimize"] if args.multiobjective else ["minimize"]
+    directions = ["minimize"] * 4 if objective_mode == "pareto" else ["minimize"]
 
     study = optuna.create_study(
         study_name=study_name,
@@ -550,11 +659,11 @@ def main() -> None:
         all_rows: List[Dict[str, Any]] = []
         step = 0
 
-        for sc in scenarios:
-            for base_seed in seeds:
-                for rep in range(args.n_repeats):
-                    seed = make_seed(base_seed, trial.number, sc, rep)
-                    try:
+        try:
+            for sc in scenarios:
+                for base_seed in seeds:
+                    for rep in range(args.n_repeats):
+                        seed = make_seed(base_seed, trial.number, sc, rep)
                         r = run_one_fit(
                             est_mod=est_mod,
                             estimator_kind=args.estimator,
@@ -565,32 +674,46 @@ def main() -> None:
                             seed=seed,
                             epochs_main=args.epochs,
                             pretrain_epochs=args.pretrain_epochs,
+                            w_auc_thr=args.w_auc_thr,
+                            z_r2_thr=args.z_r2_thr,
+                            ess_ratio_target=args.ess_ratio_target,
+                            ate_scale=args.ate_scale,
                         )
-                    except Exception:
-                        return float("inf") if not args.multiobjective else (float("inf"), 1.0, 1.0)
+                        all_rows.append(r)
 
-                    all_rows.append(r)
+                        if objective_mode == "single" and not isinstance(pruner, optuna.pruners.NopPruner):
+                            m, _ = aggregate_runs(all_rows, scenarios=scenarios, agg_repeats=args.agg)
+                            score = composite_score(m)
+                            trial.report(score, step=step)
+                            step += 1
+                            if trial.should_prune():
+                                raise optuna.TrialPruned()
 
-                    if not args.multiobjective:
-                        m = aggregate_metrics(all_rows)
-                        score = composite_score(m)
-                        trial.report(score, step=step)
-                        step += 1
-                        if trial.should_prune():
-                            raise optuna.TrialPruned()
+        except optuna.TrialPruned:
+            raise
+        except Exception as e:  # noqa: PIE786 - best-effort diagnostics
+            trial.set_user_attr("error", repr(e)[:300])
+            trial.set_user_attr("fail_stage", "simulate/fit/estimate")
+            if objective_mode == "pareto":
+                return (float("inf"), float("inf"), float("inf"), float("inf"))
+            return float("inf")
 
-        m = aggregate_metrics(all_rows)
+        m, sc_stats = aggregate_runs(all_rows, scenarios=scenarios, agg_repeats=args.agg)
 
-        trial.set_user_attr("mean_rmse", m["mean_rmse"])
-        trial.set_user_attr("mean_w_auc", m["mean_w_auc"])
-        trial.set_user_attr("mean_z_leak", m["mean_z_leak"])
-        trial.set_user_attr("mean_overlap_ess_min", m["mean_overlap_ess_min"])
-        trial.set_user_attr("mean_train_time", m["mean_train_time"])
+        trial.set_user_attr("mean_ate_err", m["ate_err"])
+        trial.set_user_attr("mean_w_auc", m["w_auc"])
+        trial.set_user_attr("mean_z_r2", m["z_r2"])
+        trial.set_user_attr("mean_ess_ratio", m["ess_ratio"])
+        trial.set_user_attr("mean_train_time", m["train_time"])
+        trial.set_user_attr("scenario_stats", json.dumps(sc_stats))
 
-        if args.multiobjective:
-            w_dev = abs(m["mean_w_auc"] - 0.5) if np.isfinite(m["mean_w_auc"]) else 0.25
-            z = m["mean_z_leak"] if np.isfinite(m["mean_z_leak"]) else 1.0
-            return (m["mean_rmse"], w_dev, z)
+        if objective_mode == "pareto":
+            return (
+                m["ate_err"],
+                m["w_violation"],
+                m["z_violation"],
+                m["ess_violation"],
+            )
 
         return composite_score(m)
 
@@ -604,13 +727,16 @@ def main() -> None:
         print(f"Storage:        {storage}")
         print(f"Study:          {study_name}")
         print(f"Mode:           {args.mode}")
-        print(f"Multiobjective: {args.multiobjective}")
+        print(f"Objective:      {objective_mode}")
         print(f"Trials:         {args.n_trials}")
         print(f"Jobs:           {args.n_jobs}")
         print(f"Scenarios:      {scenarios}")
         print(f"n:              {args.n}")
         print(f"seeds:          {seeds}  repeats={args.n_repeats}")
         print(f"epochs:         {args.epochs}  pretrain={args.pretrain_epochs}")
+        print(
+            f"thresholds: W_auc<={args.w_auc_thr}, Z_r2<={args.z_r2_thr}, ESS>={args.ess_ratio_target}, ate_scale={args.ate_scale}"
+        )
         print("=" * 90 + "\n")
 
     study.optimize(
@@ -624,7 +750,7 @@ def main() -> None:
     df = study.trials_dataframe(attrs=("number", "value", "params", "user_attrs", "state"))
     df.to_csv(outdir / "trials.csv", index=False)
 
-    if args.multiobjective:
+    if objective_mode == "pareto":
         pareto = study.best_trials
         pareto_out = []
         for t in pareto:
@@ -639,6 +765,47 @@ def main() -> None:
         (outdir / "pareto_best_trials.json").write_text(json.dumps(pareto_out, indent=2))
         pareto_sorted = sorted(pareto_out, key=lambda x: x["values"][0])
         (outdir / "pareto_top10_by_rmse.json").write_text(json.dumps(pareto_sorted[:10], indent=2))
+
+        def _metric_from_trial(tr: optuna.trial.FrozenTrial) -> Dict[str, float]:
+            ua = tr.user_attrs
+            return {
+                "ate_err": safe_float(ua.get("mean_ate_err", np.nan)),
+                "w_auc": safe_float(ua.get("mean_w_auc", np.nan)),
+                "z_r2": safe_float(ua.get("mean_z_r2", np.nan)),
+                "ess_ratio": safe_float(ua.get("mean_ess_ratio", np.nan)),
+            }
+
+        feasible: List[Dict[str, Any]] = []
+        for t in pareto:
+            met = _metric_from_trial(t)
+            if (
+                met["w_auc"] <= args.w_auc_thr
+                and met["z_r2"] <= args.z_r2_thr
+                and met["ess_ratio"] >= args.ess_ratio_target
+            ):
+                feasible.append({"trial": t.number, "params": t.params, "metrics": met, "user_attrs": dict(t.user_attrs)})
+
+        if feasible:
+            recommended = min(feasible, key=lambda x: x["metrics"].get("ate_err", float("inf")))
+            (outdir / "pareto_feasible.json").write_text(json.dumps(feasible, indent=2))
+        else:
+            fallback = []
+            for t in pareto:
+                met = _metric_from_trial(t)
+                fallback.append(
+                    {
+                        "trial": t.number,
+                        "params": t.params,
+                        "user_attrs": dict(t.user_attrs),
+                        "metrics": met,
+                        "violation": max(0.0, met["w_auc"] - args.w_auc_thr)
+                        + max(0.0, met["z_r2"] - args.z_r2_thr)
+                        + max(0.0, args.ess_ratio_target - met["ess_ratio"]),
+                    }
+                )
+            recommended = min(fallback, key=lambda x: x["violation"])
+
+        (outdir / "recommended_params.json").write_text(json.dumps(recommended, indent=2))
     else:
         best = {
             "best_value": float(study.best_value),
@@ -651,7 +818,7 @@ def main() -> None:
 
     meta = {
         "mode": args.mode,
-        "multiobjective": bool(args.multiobjective),
+        "multiobjective": bool(objective_mode == "pareto"),
         "n_trials": args.n_trials,
         "n_jobs": args.n_jobs,
         "scenarios": scenarios,
@@ -666,6 +833,12 @@ def main() -> None:
         "scenario_fn": gen_fn_name,
         "storage": storage,
         "study_name": study_name,
+        "objective_mode": objective_mode,
+        "agg": args.agg,
+        "w_auc_thr": args.w_auc_thr,
+        "z_r2_thr": args.z_r2_thr,
+        "ess_ratio_target": args.ess_ratio_target,
+        "ate_scale": args.ate_scale,
         "timestamp": datetime.now().isoformat(),
     }
     (outdir / "run_meta.json").write_text(json.dumps(meta, indent=2))
@@ -675,8 +848,9 @@ def main() -> None:
         print(f"✓ Saved: {outdir}")
         print(f"✓ Trials CSV: {outdir / 'trials.csv'}")
         print(f"✓ Study DB: {outdir / 'optuna_study.db'}")
-        if args.multiobjective:
+        if objective_mode == "pareto":
             print(f"✓ Pareto JSON: {outdir / 'pareto_best_trials.json'}")
+            print(f"✓ Recommended: {outdir / 'recommended_params.json'}")
         else:
             print(f"✓ Best params: {outdir / 'best_params.json'}")
 
