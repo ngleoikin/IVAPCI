@@ -57,14 +57,15 @@ class MethodComparison:
 
             rmse = df_m["rmse"].mean()
             mae = df_m["mean_abs_err"].mean()
-            bias = df_bench_m["err"].mean()
 
-            errors = df_bench_m["err"].values
-            if len(errors) > 1:
+            errors = self._signed_errors(df_bench_m)
+            bias = float(np.mean(errors)) if errors.size else float("nan")
+
+            if errors.size > 1:
                 ci_lower, ci_upper = stats.t.interval(
-                    0.95, len(errors) - 1, loc=np.mean(errors), scale=stats.sem(errors)
+                    0.95, len(errors) - 1, loc=float(np.mean(errors)), scale=float(stats.sem(errors))
                 )
-                ci_width = ci_upper - ci_lower
+                ci_width = float(ci_upper - ci_lower)
             else:
                 ci_width = float("nan")
 
@@ -96,7 +97,7 @@ class MethodComparison:
             return
 
         best_method = self.df_summary.groupby("method")["rmse"].mean().idxmin()
-        best_errors = self.df_bench[self.df_bench["method"] == best_method]["err"].values
+        best_errors = self._signed_errors(self.df_bench[self.df_bench["method"] == best_method])
 
         print(f"  基准方法: {best_method}")
         print("  对比方法".ljust(25) + "平均差异  t统计量  p值      显著性")
@@ -105,12 +106,12 @@ class MethodComparison:
         for method in methods:
             if method == best_method:
                 continue
-            method_errors = self.df_bench[self.df_bench["method"] == method]["err"].values
-            if len(method_errors) != len(best_errors) or len(method_errors) == 0:
+            method_errors = self._signed_errors(self.df_bench[self.df_bench["method"] == method])
+            if method_errors.size == 0 or method_errors.size != best_errors.size:
                 print(f"  {method[:23].ljust(25)}数据量不匹配，跳过")
                 continue
             t_stat, p_val = stats.ttest_rel(np.abs(method_errors), np.abs(best_errors))
-            mean_diff = np.abs(method_errors).mean() - np.abs(best_errors).mean()
+            mean_diff = float(np.abs(method_errors).mean() - np.abs(best_errors).mean())
             sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "n.s."
             print(
                 f"  {method[:23].ljust(25)}{mean_diff:+8.4f}  {t_stat:9.3f}  {p_val:7.4f}  {sig}"
@@ -214,6 +215,25 @@ class MethodComparison:
                 f"  {row['method'][:23].ljust(25)}{row['rmse']:6.3f}  {row['runtime']:8.2f}s  "
                 f"{row['efficiency_score']:8.3f}  {scenario}"
             )
+
+    @staticmethod
+    def _signed_errors(df: pd.DataFrame) -> np.ndarray:
+        """Return signed ATE errors from available columns.
+
+        Benchmark CSVs expose ``ate_hat`` and ``tau_true`` (plus ``abs_err``/``sq_err``)
+        but may lack a precomputed ``err`` column. This helper derives signed errors
+        when possible and returns an empty array otherwise.
+        """
+
+        if df.empty:
+            return np.array([], dtype=float)
+
+        cols = set(df.columns)
+        if {"ate_hat", "tau_true"} <= cols:
+            return (df["ate_hat"] - df["tau_true"]).to_numpy(dtype=float)
+        if "err" in cols:
+            return df["err"].to_numpy(dtype=float)
+        return np.array([], dtype=float)
 
 
 class IVAPCIv22Analyzer:
