@@ -53,3 +53,21 @@ python scripts/run_simulation_benchmark.py \
 ```
 
 Diagnostics and plotting work the same way by passing the methods to `scripts/run_diagnostics_on_simulation.py` and the corresponding analysis scripts.
+
+## Hyperparameter search (grid + Bayesian)
+
+Two standalone scripts support in-process sweeps over IVAPCI v3.3 configurations:
+
+- `scripts/run_hyperparam_search.py` performs grid sweeps over preset search spaces and exports per-run/per-scenario summaries plus best/top configs.
+- `scripts/bayesian_hyperparam_search_ivapci.py` runs Optuna-based Bayesian search (TPE or NSGA-II) across scenarios/seeds, writing trials to an SQLite study plus CSV/JSON artifacts. Install `optuna` (and optionally `optuna-dashboard`) before use.
+
+Example (TPE, single-objective):
+
+```bash
+python scripts/bayesian_hyperparam_search_ivapci.py \
+  --mode quick \
+  --scenarios EASY-linear-weak,MODERATE-nonlinear \
+  --n-trials 40 \
+  --epochs 100 \
+  --n 500
+```
