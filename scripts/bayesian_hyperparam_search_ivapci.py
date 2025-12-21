@@ -81,6 +81,47 @@ def median_abs_deviation(arr: np.ndarray) -> float:
     return float(np.median(np.abs(arr - med)))
 
 
+def check_convergence_plateau(
+    study: optuna.Study,
+    *,
+    window: int = 25,
+    rel_impr_thr: float = 0.003,
+    min_trials: int = 30,
+    objective_index: int = 0,
+) -> bool:
+    """Detect a plateau when recent improvements fall below a threshold.
+
+    Compares the best value before the last ``window`` trials with the best value
+    *within* the last window. If the relative improvement is smaller than
+    ``rel_impr_thr`` the search is considered converged and can be stopped early.
+    """
+
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if len(completed) < max(min_trials, window + 5):
+        return False
+
+    values: list[float] = []
+    for t in completed:
+        # ``values`` exists for both single/multi objective; fall back to ``value``
+        val: Optional[float]
+        if t.values is not None and len(t.values) > objective_index:
+            val = t.values[objective_index]
+        else:
+            val = t.value
+        if val is None or not np.isfinite(val):
+            continue
+        values.append(float(val))
+
+    if len(values) < max(min_trials, window + 5):
+        return False
+
+    best_before = float(np.min(values[:-window]))
+    best_recent = float(np.min(values[-window:]))
+    denom = max(abs(best_before), 1e-12)
+    rel_impr = (best_before - best_recent) / denom
+    return rel_impr < rel_impr_thr
+
+
 # -------------------- 自动探测：estimator module --------------------
 
 def try_import_first(candidates: Sequence[str]) -> Tuple[str, Any]:
@@ -604,6 +645,73 @@ def aggregate_runs(
     return global_stats, scenario_stats
 
 
+def validate_best_config(
+    *,
+    est_mod: Any,
+    estimator_kind: str,
+    scenario_fn: Callable[..., Any],
+    scenarios: List[str],
+    params: Dict[str, Any],
+    args: argparse.Namespace,
+    outdir: Path,
+) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
+    for sc in scenarios:
+        for i in range(args.val_repeats):
+            base_seed = int(args.val_seed_offset + i)
+            seed = make_seed(base_seed, trial_num=-1, scenario=sc, repeat=0)
+            try:
+                r = run_one_fit(
+                    est_mod=est_mod,
+                    estimator_kind=estimator_kind,
+                    cfg_overrides=params,
+                    scenario_fn=scenario_fn,
+                    scenario_name=sc,
+                    n=args.n,
+                    base_seed=base_seed,
+                    seed=seed,
+                    rep=0,
+                    epochs_main=args.epochs,
+                    pretrain_epochs=args.pretrain_epochs,
+                    w_auc_hinge=args.w_auc_hinge,
+                    z_r2_hinge=args.z_r2_hinge,
+                    ess_ratio_target=args.ess_ratio_target,
+                    ate_scale=args.ate_scale,
+                )
+            except Exception as e:  # noqa: PIE786 - best-effort validation
+                rows.append(
+                    {"scenario": sc, "base_seed": base_seed, "rep": 0, "status": "failed", "error": str(e)[:200]}
+                )
+                continue
+            rows.append(r)
+
+    df_val = pd.DataFrame(rows)
+    df_path = outdir / "validation_runs.csv"
+    df_val.to_csv(df_path, index=False)
+
+    ok = df_val[df_val.get("status", "success") == "success"]
+    summary: Dict[str, Any]
+    if ok.empty:
+        summary = {
+            "n_success": 0,
+            "n_total": len(df_val),
+            "message": "No successful validation runs",
+        }
+    else:
+        summary = {
+            "n_success": int(len(ok)),
+            "n_total": int(len(df_val)),
+            "mean_auc_eff": float(ok["w_auc_eff"].mean()),
+            "mean_z_r2": float(ok["z_r2"].mean()),
+            "mean_ess_ratio": float(ok["ess_ratio"].mean()),
+            "median_rel_abs_err": float(ok["rel_abs_err"].median()),
+            "scenarios": scenarios,
+        }
+
+    (outdir / "validation_summary.json").write_text(json.dumps(summary, indent=2))
+    return summary
+
+
 def composite_score_from_scenarios(
     scenario_stats: List[Dict[str, Any]], *, w_auc_hinge: float, z_r2_hinge: float, ess_ratio_target: float
 ) -> float:
@@ -683,6 +791,13 @@ def main() -> None:
     parser.add_argument("--ess-ratio-target", type=float, default=0.40, help="Minimum ESS ratio target (hinge)")
     parser.add_argument("--ess-ratio-feasible", type=float, default=0.35, help="ESS feasibility floor")
     parser.add_argument("--ate-scale", choices=["y_std", "y_mad", "tau_abs"], default="y_std", help="normalize ATE error")
+    parser.add_argument("--plateau-window", type=int, default=25, help="Plateau detection window (trials)")
+    parser.add_argument("--plateau-rel-impr", type=float, default=0.003, help="Relative improvement threshold for plateau stop")
+    parser.add_argument("--plateau-min-trials", type=int, default=30, help="Minimum completed trials before plateau check")
+    parser.add_argument("--validate-best", action="store_true", help="Run independent-seed validation on recommended params")
+    parser.add_argument("--val-repeats", type=int, default=10, help="Validation runs per scenario (distinct seeds)")
+    parser.add_argument("--val-seed-offset", type=int, default=10_000, help="Offset applied to validation seeds")
+    parser.add_argument("--val-scenarios", type=str, default=None, help="Optional holdout scenarios for validation (comma/space)")
     parser.add_argument("--quiet", action="store_true")
 
     args = parser.parse_args()
@@ -695,6 +810,7 @@ def main() -> None:
     scenarios = normalize_scenarios_arg(args.scenarios, gen_mod_name)
 
     seeds = [int(x) for x in args.seeds.replace(",", " ").split() if x.strip()]
+    val_scenarios = normalize_scenarios_arg(args.val_scenarios, gen_mod_name) if args.val_scenarios else list(scenarios)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     outdir = Path(args.output_dir or f"optuna_search_{args.mode}_{ts}")
@@ -841,7 +957,31 @@ def main() -> None:
             f"ESS>=hinge {args.ess_ratio_target} / feasible {args.ess_ratio_feasible}, "
             f"ate_scale={args.ate_scale}"
         )
+        if args.plateau_window > 0:
+            print(
+                f"plateau: window={args.plateau_window}, rel_impr_thr={args.plateau_rel_impr}, min_trials={args.plateau_min_trials}"
+            )
+        if args.validate_best:
+            print(
+                f"validation: repeats={args.val_repeats}, seed_offset={args.val_seed_offset}, scenarios={val_scenarios}"
+            )
         print("=" * 90 + "\n")
+
+    callbacks: List[Callable[[optuna.Study, optuna.trial.FrozenTrial], None]] = []
+    if args.plateau_window > 0:
+        def _plateau_cb(study: optuna.Study, _trial: optuna.trial.FrozenTrial) -> None:
+            if check_convergence_plateau(
+                study,
+                window=args.plateau_window,
+                rel_impr_thr=args.plateau_rel_impr,
+                min_trials=args.plateau_min_trials,
+                objective_index=0,
+            ):
+                if not args.quiet:
+                    print("[Stop] Plateau detected. Early stopping.")
+                study.stop()
+
+        callbacks.append(_plateau_cb)
 
     study.optimize(
         objective,
@@ -849,6 +989,7 @@ def main() -> None:
         n_jobs=args.n_jobs,
         timeout=timeout,
         show_progress_bar=(not args.quiet),
+        callbacks=callbacks,
     )
 
     attr_cols = ("number", "values", "params", "user_attrs", "state") if objective_mode == "pareto" else (
@@ -861,6 +1002,7 @@ def main() -> None:
     df = study.trials_dataframe(attrs=attr_cols)
     df.to_csv(outdir / "trials.csv", index=False)
 
+    best_params_for_validation: Optional[Dict[str, Any]] = None
     if objective_mode == "pareto":
         pareto = study.best_trials
         pareto_out = []
@@ -902,6 +1044,7 @@ def main() -> None:
         if feasible:
             recommended = min(feasible, key=lambda x: x["metrics"].get("ate_err", float("inf")))
             (outdir / "pareto_feasible.json").write_text(json.dumps(feasible, indent=2))
+            best_params_for_validation = recommended.get("params")
         else:
             fallback: List[Dict[str, Any]] = []
             for t in completed:
@@ -920,6 +1063,11 @@ def main() -> None:
                     }
                 )
             recommended = min(fallback, key=lambda x: x.get("violation", float("inf"))) if fallback else {}
+            if recommended:
+                best_params_for_validation = recommended.get("params")
+
+        if not best_params_for_validation and pareto_out:
+            best_params_for_validation = pareto_out[0].get("params")
 
         if recommended:
             (outdir / "recommended_params.json").write_text(json.dumps(recommended, indent=2))
@@ -932,6 +1080,24 @@ def main() -> None:
             "n_trials": len(study.trials),
         }
         (outdir / "best_params.json").write_text(json.dumps(best, indent=2))
+        best_params_for_validation = dict(study.best_params)
+
+    val_summary: Optional[Dict[str, Any]] = None
+    if args.validate_best and best_params_for_validation:
+        try:
+            val_summary = validate_best_config(
+                est_mod=est_mod,
+                estimator_kind=args.estimator,
+                scenario_fn=scenario_fn,
+                scenarios=val_scenarios,
+                params=best_params_for_validation,
+                args=args,
+                outdir=outdir,
+            )
+            if not args.quiet:
+                print("Validation summary:", val_summary)
+        except Exception as e:  # noqa: PIE786 - best-effort validation
+            (outdir / "validation_error.txt").write_text(str(e))
 
     meta = {
         "mode": args.mode,
@@ -959,6 +1125,14 @@ def main() -> None:
         "ess_ratio_target": args.ess_ratio_target,
         "ess_ratio_feasible": args.ess_ratio_feasible,
         "ate_scale": args.ate_scale,
+        "plateau_window": args.plateau_window,
+        "plateau_rel_impr": args.plateau_rel_impr,
+        "plateau_min_trials": args.plateau_min_trials,
+        "validate_best": args.validate_best,
+        "val_repeats": args.val_repeats,
+        "val_seed_offset": args.val_seed_offset,
+        "val_scenarios": val_scenarios,
+        "validation_summary": val_summary,
         "timestamp": datetime.now().isoformat(),
     }
     (outdir / "run_meta.json").write_text(json.dumps(meta, indent=2))

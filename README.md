@@ -127,6 +127,7 @@ python scripts/bayesian_hyperparam_search_ivapci.py \
 - **模式/目标**：`--objective-mode {pareto,single}`（默认 pareto）；`--mode {quick,balanced,focused_w}` 选择采样空间
 - **阈值/可行域**：`--w-auc-hinge`/`--w-auc-feasible`，`--z-r2-hinge`/`--z-r2-feasible`，`--ess-ratio-target` 控制惩罚与可行筛选；`--ate-scale {y_std,y_mad,tau_abs}` 控制 ATE 归一化
 - **搜索控制**：`--sampler {tpe,nsga2}`，`--pruner {median,hyperband,none}`（帕累托自动禁用剪枝），`--n-trials / --n-jobs / --timeout-hours`
+- **收敛/验证**：`--plateau-window/--plateau-rel-impr` 可自动检测平台期提前停止；`--validate-best` 在独立 seeds 上复核推荐超参（`--val-repeats/--val-seed-offset/--val-scenarios` 可调）
 - **数据/模型**：`--estimator`、`--scenario-module`、`--scenario-fn`、`--scenarios`（用逗号或带引号的空格分隔）
 - **其他**：`--agg` 设定重复层聚合（默认 median），`--output-dir`/`--study-name` 控制输出
 
