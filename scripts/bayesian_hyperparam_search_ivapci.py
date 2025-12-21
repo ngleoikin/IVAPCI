@@ -117,6 +117,10 @@ def resolve_estimator_module(user_spec: Optional[str]) -> Any:
 # -------------------- 自动探测：scenario generator --------------------
 
 def resolve_scenario_generator(module_name: Optional[str], fn_name: Optional[str]) -> Tuple[str, str, Callable[..., Any]]:
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
     module_candidates = []
     if module_name:
         module_candidates.append(module_name)
@@ -125,13 +129,22 @@ def resolve_scenario_generator(module_name: Optional[str], fn_name: Optional[str
         "scripts.simulation_configs",
         "simulation_scenarios",
         "scripts.simulation_scenarios",
+        "simulators",
+        "simulators.simulators",
         "ivapci.simulation_configs",
         "ivapci.simulation_scenarios",
     ]
     fn_candidates = []
     if fn_name:
         fn_candidates.append(fn_name)
-    fn_candidates += ["generate_scenario", "make_scenario", "sample_scenario", "generate"]
+    fn_candidates += [
+        "generate_scenario",
+        "make_scenario",
+        "sample_scenario",
+        "generate",
+        "simulate_scenario",
+        "simulate",
+    ]
 
     last_err = None
     for mn in module_candidates:
@@ -162,6 +175,15 @@ def list_available_scenarios(gen_module_name: str) -> Optional[List[str]]:
     if hasattr(m, "get_available_scenarios") and callable(getattr(m, "get_available_scenarios")):
         try:
             return [str(x) for x in list(getattr(m, "get_available_scenarios")())]
+        except Exception:
+            pass
+
+    if hasattr(m, "list_scenarios") and callable(getattr(m, "list_scenarios")):
+        try:
+            vals = getattr(m, "list_scenarios")()
+            if isinstance(vals, dict):
+                return [str(k) for k in vals.keys()]
+            return [str(x) for x in list(vals)]
         except Exception:
             pass
 
