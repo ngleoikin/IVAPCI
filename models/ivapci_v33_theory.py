@@ -525,8 +525,9 @@ class IVAPCIV33TheoryConfig:
         # Keep training ESS targets conservative on small n to avoid aggressive clipping.
         if getattr(self, "ess_target_train", None) is None:
             r = float(np.log1p(n) / max(1e-6, np.log1p(2000.0)))
-            self.ess_target_train = float(np.clip(0.25 + 0.18 * r, 0.25, 0.55))
-        self.ess_target = float(np.clip(self.ess_target_train + 0.05, 0.30, 0.60))
+            # more conservative training ESS to avoid aggressive clipping on small n
+            self.ess_target_train = float(np.clip(0.20 + 0.15 * r, 0.20, 0.45))
+        self.ess_target = float(np.clip(self.ess_target_train + 0.05, 0.25, 0.55))
 
         # Allow adaptive clipping to select the minimum threshold that reaches ESS goals.
         self.clip_prop = float(min(self.clip_prop, 0.01))
@@ -1093,7 +1094,11 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         # Stage 1: full training
         for epoch in range(cfg.epochs_main):
             # lightweight diagnostics for adaptive scheduling (EMA-smoothed)
-            if (epoch % max(1, cfg.monitor_every)) == 0:
+            if (
+                (cfg.monitor_every is not None)
+                and (cfg.monitor_every > 0)
+                and ((epoch % cfg.monitor_every) == 0)
+            ):
                 diag_now = self._quick_monitor(V_tr_std, A_tr, Y_tr_std, max_n=cfg.monitor_batch_size)
                 if not hasattr(self, "_diag_ema"):
                     self._diag_ema = dict(diag_now)
@@ -1133,17 +1138,17 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                 diag_now = getattr(self, "training_diagnostics", {}) or {}
                 w_auc = float(diag_now.get("rep_auc_w_to_a", 0.5))
                 z_r2 = float(diag_now.get("rep_exclusion_leakage_r2", 0.0))
-                if w_auc > 0.62 or z_r2 > 0.18:
+                if w_auc > 0.58 or z_r2 > 0.16:
                     adv_steps_ep += 1
-                if w_auc > 0.68 or z_r2 > 0.25:
+                if w_auc > 0.64 or z_r2 > 0.22:
                     adv_steps_ep += 1
                 adv_steps_ep = int(np.clip(adv_steps_ep, cfg.adv_steps_min, cfg.adv_steps_max))
 
                 # leak-driven strength boost: increase adversarial strength when leakage is high
                 leak_boost = 1.0
-                if w_auc > 0.68:
+                if w_auc > 0.64:
                     leak_boost = 1.2
-                elif w_auc > 0.62:
+                elif w_auc > 0.58:
                     leak_boost = 1.1
                 gamma_w_use *= leak_boost
                 gamma_w_cond *= leak_boost
