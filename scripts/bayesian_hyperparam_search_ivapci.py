@@ -393,6 +393,8 @@ def _y_scale(Y: np.ndarray, tau_true: float, mode: str) -> float:
         scale = float(np.std(y))
     if not np.isfinite(scale) or scale <= 0:
         scale = float(np.std(y) + 1e-8)
+    # 防止极低方差场景下的缩放噪声被放大
+    scale = max(scale, 0.5)
     return float(scale + 1e-8)
 
 
@@ -403,12 +405,14 @@ def run_one_fit(
     scenario_fn: Callable[..., Any],
     scenario_name: str,
     n: int,
+    base_seed: int,
     seed: int,
+    rep: int,
     epochs_main: int,
     pretrain_epochs: Optional[int],
     *,
-    w_auc_thr: float,
-    z_r2_thr: float,
+    w_auc_hinge: float,
+    z_r2_hinge: float,
     ess_ratio_target: float,
     ate_scale: str,
 ) -> Dict[str, Any]:
@@ -460,14 +464,16 @@ def run_one_fit(
         z_r2 = 0.0
     ess_ratio = _ess_ratio_from_diag(diag, n)
 
-    w_violation = max(0.0, float(w_auc) - float(w_auc_thr)) ** 2
-    z_violation = max(0.0, float(z_r2) - float(z_r2_thr)) ** 2
+    w_violation = max(0.0, float(w_auc) - float(w_auc_hinge)) ** 2
+    z_violation = max(0.0, float(z_r2) - float(z_r2_hinge)) ** 2
     ess_violation = max(0.0, float(ess_ratio_target) - float(ess_ratio))
 
     return {
         "status": "success",
         "scenario": scenario_name,
         "seed": int(seed),
+        "base_seed": int(base_seed),
+        "rep": int(rep),
         "ate_hat": float(ate_hat),
         "tau_true": tau_true_f,
         "y_scale": y_scale_val,
@@ -502,10 +508,10 @@ def aggregate_runs(runs: List[Dict[str, Any]], *, scenarios: List[str], agg_repe
         sc_rows = [r for r in runs if r.get("scenario") == sc and r.get("status") == "success"]
         if not sc_rows:
             continue
-        seeds = sorted(set(int(r.get("seed", 0)) for r in sc_rows))
+        base_seeds = sorted(set(int(r.get("base_seed", -1)) for r in sc_rows))
         seed_stats: List[Dict[str, float]] = []
-        for seed in seeds:
-            seed_rows = [r for r in sc_rows if int(r.get("seed", 0)) == seed]
+        for bs in base_seeds:
+            seed_rows = [r for r in sc_rows if int(r.get("base_seed", -1)) == bs]
             seed_stats.append({
                 "ate_err": _agg([r.get("ate_err", np.nan) for r in seed_rows], agg_repeats),
                 "w_violation": _agg([r.get("w_violation", np.nan) for r in seed_rows], agg_repeats),
@@ -594,9 +600,12 @@ def main() -> None:
     parser.add_argument("--sampler", choices=["tpe", "nsga2"], default="tpe")
     parser.add_argument("--pruner", choices=["median", "hyperband", "none"], default="median")
     parser.add_argument("--agg", choices=["median", "mean"], default="median", help="repeat-level aggregation")
-    parser.add_argument("--w-auc-thr", type=float, default=0.55, help="W→A AUC upper bound for violation hinge")
-    parser.add_argument("--z-r2-thr", type=float, default=0.05, help="Z→Y leakage R2 upper bound for violation hinge")
-    parser.add_argument("--ess-ratio-target", type=float, default=0.40, help="Minimum ESS ratio target")
+    parser.add_argument("--w-auc-hinge", "--w-auc-thr", dest="w_auc_hinge", type=float, default=0.55, help="W→A AUC hinge threshold")
+    parser.add_argument("--w-auc-feasible", type=float, default=0.56, help="W→A feasibility upper bound")
+    parser.add_argument("--z-r2-hinge", "--z-r2-thr", dest="z_r2_hinge", type=float, default=0.05, help="Z→Y leakage hinge R2")
+    parser.add_argument("--z-r2-feasible", type=float, default=0.08, help="Z→Y feasibility R2 upper bound")
+    parser.add_argument("--ess-ratio-target", type=float, default=0.40, help="Minimum ESS ratio target (hinge)")
+    parser.add_argument("--ess-ratio-feasible", type=float, default=0.35, help="ESS feasibility floor")
     parser.add_argument("--ate-scale", choices=["y_std", "y_mad", "tau_abs"], default="y_std", help="normalize ATE error")
     parser.add_argument("--quiet", action="store_true")
 
@@ -671,11 +680,13 @@ def main() -> None:
                             scenario_fn=scenario_fn,
                             scenario_name=sc,
                             n=args.n,
+                            base_seed=base_seed,
                             seed=seed,
+                            rep=rep,
                             epochs_main=args.epochs,
                             pretrain_epochs=args.pretrain_epochs,
-                            w_auc_thr=args.w_auc_thr,
-                            z_r2_thr=args.z_r2_thr,
+                            w_auc_hinge=args.w_auc_hinge,
+                            z_r2_hinge=args.z_r2_hinge,
                             ess_ratio_target=args.ess_ratio_target,
                             ate_scale=args.ate_scale,
                         )
@@ -735,7 +746,11 @@ def main() -> None:
         print(f"seeds:          {seeds}  repeats={args.n_repeats}")
         print(f"epochs:         {args.epochs}  pretrain={args.pretrain_epochs}")
         print(
-            f"thresholds: W_auc<={args.w_auc_thr}, Z_r2<={args.z_r2_thr}, ESS>={args.ess_ratio_target}, ate_scale={args.ate_scale}"
+            "thresholds: "
+            f"W_auc<=hinge {args.w_auc_hinge} / feasible {args.w_auc_feasible}, "
+            f"Z_r2<=hinge {args.z_r2_hinge} / feasible {args.z_r2_feasible}, "
+            f"ESS>=hinge {args.ess_ratio_target} / feasible {args.ess_ratio_feasible}, "
+            f"ate_scale={args.ate_scale}"
         )
         print("=" * 90 + "\n")
 
@@ -764,7 +779,7 @@ def main() -> None:
             )
         (outdir / "pareto_best_trials.json").write_text(json.dumps(pareto_out, indent=2))
         pareto_sorted = sorted(pareto_out, key=lambda x: x["values"][0])
-        (outdir / "pareto_top10_by_rmse.json").write_text(json.dumps(pareto_sorted[:10], indent=2))
+        (outdir / "pareto_top10_by_ate_err.json").write_text(json.dumps(pareto_sorted[:10], indent=2))
 
         def _metric_from_trial(tr: optuna.trial.FrozenTrial) -> Dict[str, float]:
             ua = tr.user_attrs
@@ -776,36 +791,42 @@ def main() -> None:
             }
 
         feasible: List[Dict[str, Any]] = []
-        for t in pareto:
+        completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        for t in completed:
             met = _metric_from_trial(t)
             if (
-                met["w_auc"] <= args.w_auc_thr
-                and met["z_r2"] <= args.z_r2_thr
-                and met["ess_ratio"] >= args.ess_ratio_target
+                np.isfinite(list(met.values())).all()
+                and met["w_auc"] <= args.w_auc_feasible
+                and met["z_r2"] <= args.z_r2_feasible
+                and met["ess_ratio"] >= args.ess_ratio_feasible
             ):
                 feasible.append({"trial": t.number, "params": t.params, "metrics": met, "user_attrs": dict(t.user_attrs)})
 
+        recommended: Dict[str, Any]
         if feasible:
             recommended = min(feasible, key=lambda x: x["metrics"].get("ate_err", float("inf")))
             (outdir / "pareto_feasible.json").write_text(json.dumps(feasible, indent=2))
         else:
-            fallback = []
-            for t in pareto:
+            fallback: List[Dict[str, Any]] = []
+            for t in completed:
                 met = _metric_from_trial(t)
+                if not np.isfinite(list(met.values())).all():
+                    continue
                 fallback.append(
                     {
                         "trial": t.number,
                         "params": t.params,
                         "user_attrs": dict(t.user_attrs),
                         "metrics": met,
-                        "violation": max(0.0, met["w_auc"] - args.w_auc_thr)
-                        + max(0.0, met["z_r2"] - args.z_r2_thr)
-                        + max(0.0, args.ess_ratio_target - met["ess_ratio"]),
+                        "violation": max(0.0, met["w_auc"] - args.w_auc_feasible)
+                        + max(0.0, met["z_r2"] - args.z_r2_feasible)
+                        + max(0.0, args.ess_ratio_feasible - met["ess_ratio"]),
                     }
                 )
-            recommended = min(fallback, key=lambda x: x["violation"])
+            recommended = min(fallback, key=lambda x: x.get("violation", float("inf"))) if fallback else {}
 
-        (outdir / "recommended_params.json").write_text(json.dumps(recommended, indent=2))
+        if recommended:
+            (outdir / "recommended_params.json").write_text(json.dumps(recommended, indent=2))
     else:
         best = {
             "best_value": float(study.best_value),
@@ -835,9 +856,12 @@ def main() -> None:
         "study_name": study_name,
         "objective_mode": objective_mode,
         "agg": args.agg,
-        "w_auc_thr": args.w_auc_thr,
-        "z_r2_thr": args.z_r2_thr,
+        "w_auc_hinge": args.w_auc_hinge,
+        "w_auc_feasible": args.w_auc_feasible,
+        "z_r2_hinge": args.z_r2_hinge,
+        "z_r2_feasible": args.z_r2_feasible,
         "ess_ratio_target": args.ess_ratio_target,
+        "ess_ratio_feasible": args.ess_ratio_feasible,
         "ate_scale": args.ate_scale,
         "timestamp": datetime.now().isoformat(),
     }
