@@ -42,6 +42,7 @@ import argparse
 import hashlib
 import importlib
 import json
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -85,10 +86,29 @@ def try_import_first(candidates: Sequence[str]) -> Tuple[str, Any]:
 
 
 def resolve_estimator_module(user_spec: Optional[str]) -> Any:
+    """Resolve estimator module, handling repo-local imports by default.
+
+    When running from the repository root, the ``models`` package is not on
+    ``sys.path`` by default. We prepend the repo root so that imports such as
+    ``models.ivapci_v33_theory`` work without additional flags. Users can still
+    override via ``--estimator-module``.
+    """
+
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
     candidates = []
     if user_spec:
         candidates.append(user_spec)
-    candidates += ["ivapci_v33_theory_v27", "ivapci_v33_theory_v26", "ivapci_v33_theory"]
+    candidates += [
+        "models.ivapci_v33_theory_v27",
+        "models.ivapci_v33_theory_v26",
+        "models.ivapci_v33_theory",
+        "ivapci_v33_theory_v27",
+        "ivapci_v33_theory_v26",
+        "ivapci_v33_theory",
+    ]
     mod_name, mod = try_import_first(candidates)
     print(f"[Info] Using estimator module: {mod_name}")
     return mod

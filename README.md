@@ -85,6 +85,7 @@ python scripts/run_hyperparam_search.py \
 - `--estimator {hier,hier_radr}`：选择 IVAPCI 或 RADR 变体
 - `--scenario-module / --scenario-fn`：自定义数据生成器
 - `--checkpoint-every 5`：每跑完 N 个配置写入断点
+- `--scenarios`：用 **逗号** 分隔（或用引号包裹的空格分隔），否则 shell 会把场景名当独立参数
 
 运行结束后，可直接查看 `outputs/grid_quick/best_config.json` 或用生成的 `results.csv` 做二次分析。
 
@@ -118,6 +119,8 @@ python scripts/bayesian_hyperparam_search_ivapci.py \
 - `--sampler {tpe,nsga2}` / `--pruner {median,hyperband,none}`：采样与剪枝策略
 - `--n-trials / --n-jobs / --timeout-hours`：控制搜索规模与并行
 - 同样支持 `--estimator`、`--scenario-module`、`--scenario-fn` 覆盖
+- `--scenarios`：推荐用 **逗号** 或带引号的空格分隔防止 CLI 解析错误
+- 模型导入：脚本会自动把仓库根目录加入 `sys.path` 并尝试 `models.ivapci_v33_theory*`，如仍失败可显式指定 `--estimator-module models.ivapci_v33_theory`
 
 **结果查看**
 - 单目标：`best_params.json` 给出最佳 trial；`trials.csv` 可用 pandas/Excel 分析；`optuna-dashboard sqlite:///outputs/optuna_quick/optuna_study.db` 可实时查看进度
