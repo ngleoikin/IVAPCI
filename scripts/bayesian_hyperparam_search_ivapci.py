@@ -504,7 +504,12 @@ def run_one_fit(
     w_auc_eff = max(float(w_auc_raw), 1.0 - float(w_auc_raw))
     w_leak = max(0.0, w_auc_eff - 0.5)
 
-    z_r2 = safe_float(diag.get("rep_exclusion_leakage_r2", np.nan))
+    z_r2 = safe_float(
+        diag.get(
+            "rep_exclusion_leakage_r2_cond",
+            diag.get("rep_exclusion_leakage_r2", np.nan),
+        )
+    )
     if not np.isfinite(z_r2):
         z_r2 = 0.0
     z_leak = max(0.0, float(z_r2))

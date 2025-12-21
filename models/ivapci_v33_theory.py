@@ -742,6 +742,25 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             recon = self.decoder(torch.cat([tx, tw, tz, tn], dim=1))
             info_loss = float(torch.mean((recon - vb) ** 2).detach().cpu().item())
 
+            # Conditional Z leakage: regress out (A, Tx, Tw) before measuring tz → residual R²
+            try:
+                y_np = yb.cpu().numpy()
+                tx_np = tx.cpu().numpy()
+                tw_np = tw.cpu().numpy()
+                tz_np = tz.cpu().numpy()
+
+                cov = np.column_stack([np.ones_like(y_np), ab.cpu().numpy(), tx_np, tw_np])
+                coef, *_ = np.linalg.lstsq(cov, y_np, rcond=None)
+                y_resid = y_np - cov @ coef
+
+                lr_coef, *_ = np.linalg.lstsq(tz_np, y_resid, rcond=None)
+                y_resid_hat = tz_np @ lr_coef
+                ss_res = float(np.sum((y_resid - y_resid_hat) ** 2))
+                ss_tot = float(np.sum((y_resid - y_resid.mean()) ** 2) + 1e-12)
+                z_r2_cond = 1.0 - ss_res / ss_tot
+            except Exception:
+                z_r2_cond = float("nan")
+
         # restore training states
         for m, state in zip(modules, train_states):
             m.train(mode=state)
@@ -759,6 +778,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         return {
             "rep_auc_w_to_a": w_auc,
             "rep_exclusion_leakage_r2": z_r2,
+            "rep_exclusion_leakage_r2_cond": z_r2_cond,
             "overlap_ess_min": ess_min,
             "info_loss_proxy": info_loss,
         }
