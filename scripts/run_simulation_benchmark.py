@@ -419,8 +419,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=list(AVAILABLE_METHODS),
+        default=None,
         help="Causal estimators to evaluate (space or comma separated).",
+    )
+    parser.add_argument(
+        "--all-methods",
+        action="store_true",
+        help="Run every supported estimator (overrides --methods).",
     )
     parser.add_argument(
         "--variant",
@@ -437,10 +442,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     args.scenarios = _normalize_scenarios(args.scenarios)
-    args.methods = _normalize_methods(args.methods)
+    if args.all_methods and args.methods:
+        raise SystemExit("Specify either --methods or --all-methods, not both.")
+    if args.all_methods:
+        args.methods = list(AVAILABLE_METHODS)
+    elif args.methods:
+        args.methods = _normalize_methods(args.methods)
+    else:
+        raise SystemExit("Please provide --methods <list> or --all-methods to select estimators.")
     outdir = Path(args.outdir) if args.outdir else None
     if outdir:
         outdir.mkdir(parents=True, exist_ok=True)
+    print(f"Running methods: {args.methods}")
     results_path = (
         Path(args.results_path)
         if args.results_path is not None
