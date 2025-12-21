@@ -4,10 +4,24 @@ This repository provides the simulation, modeling, and diagnostics tooling descr
 
 ## Setup
 
-Install the Python dependencies before running any benchmarks, diagnostics, or smoke tests (NumPy is pinned to <2 for PyTorch compatibility):
+Install the Python dependencies before running any benchmarks, diagnostics, or smoke tests (NumPy is pinned to <2 for PyTorch compatibility). A fully isolated setup using conda is recommended:
 
 ```bash
+# Start in the repo root
+cd /root/IVAPCI
+
+# Load conda (if not already available in the shell)
+source /root/miniconda3/etc/profile.d/conda.sh
+
+# Create and activate a dedicated environment
+conda create -n ivapci311 python=3.11 -y
+conda activate ivapci311
+
+# Install core requirements
 pip install -r requirements.txt
+
+# Ensure scientific stack is up to date
+pip install -U numpy scipy scikit-learn pandas torch seaborn matplotlib
 ```
 
 ## Quick smoke test
