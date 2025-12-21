@@ -13,10 +13,207 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from scipy import stats
 
 
 warnings.filterwarnings("ignore")
 sns.set_style("whitegrid")
+
+
+class MethodComparison:
+    """方法级性能对比与显著性分析。"""
+
+    def __init__(self, df_bench: pd.DataFrame, df_summary: pd.DataFrame):
+        self.df_bench = df_bench
+        self.df_summary = df_summary
+
+    def comprehensive_method_comparison(self) -> None:
+        """按方法聚合输出：核心指标、显著性、鲁棒性、表征分析与效率。"""
+
+        print("\n" + "=" * 80)
+        print(" " * 20 + "📊 方法性能综合对比")
+        print("=" * 80)
+
+        methods = list(self.df_summary["method"].unique()) if "method" in self.df_summary.columns else []
+        if not methods:
+            print("  ℹ️  未找到方法列，跳过方法对比")
+            return
+
+        self._print_performance_table(methods)
+        self._print_significance_tests(methods)
+        self._print_scenario_robustness(methods)
+        self._print_representation_methods_analysis()
+        self._print_efficiency_tradeoff(methods)
+
+    def _print_performance_table(self, methods: List[str]) -> None:
+        print("\n【1️⃣ 核心性能指标对比】")
+        print("  方法名称".ljust(25) + "RMSE    MAE     偏差    CI95    时间(s)  排名")
+        print("  " + "-" * 75)
+
+        stats_list: List[Dict[str, float]] = []
+        for method in methods:
+            df_m = self.df_summary[self.df_summary["method"] == method]
+            df_bench_m = self.df_bench[self.df_bench["method"] == method]
+
+            rmse = df_m["rmse"].mean()
+            mae = df_m["mean_abs_err"].mean()
+            bias = df_bench_m["err"].mean()
+
+            errors = df_bench_m["err"].values
+            if len(errors) > 1:
+                ci_lower, ci_upper = stats.t.interval(
+                    0.95, len(errors) - 1, loc=np.mean(errors), scale=stats.sem(errors)
+                )
+                ci_width = ci_upper - ci_lower
+            else:
+                ci_width = float("nan")
+
+            runtime = df_m["mean_runtime"].mean()
+            stats_list.append(
+                {
+                    "method": method,
+                    "rmse": rmse,
+                    "mae": mae,
+                    "bias": abs(bias),
+                    "ci_width": ci_width,
+                    "runtime": runtime,
+                }
+            )
+
+        stats_df = pd.DataFrame(stats_list).sort_values("rmse")
+        for rank, (_, row) in enumerate(stats_df.iterrows(), 1):
+            medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else "  "
+            print(
+                f"  {row['method'][:23].ljust(25)}"
+                f"{row['rmse']:6.3f}  {row['mae']:6.3f}  {row['bias']:6.3f}  "
+                f"{row['ci_width']:6.3f}  {row['runtime']:7.2f}  {medal}{rank}"
+            )
+
+    def _print_significance_tests(self, methods: List[str]) -> None:
+        print("\n【2️⃣ 配对t检验（vs 最佳方法）】")
+        if not methods:
+            print("  ℹ️ 方法列表为空，跳过显著性检验")
+            return
+
+        best_method = self.df_summary.groupby("method")["rmse"].mean().idxmin()
+        best_errors = self.df_bench[self.df_bench["method"] == best_method]["err"].values
+
+        print(f"  基准方法: {best_method}")
+        print("  对比方法".ljust(25) + "平均差异  t统计量  p值      显著性")
+        print("  " + "-" * 65)
+
+        for method in methods:
+            if method == best_method:
+                continue
+            method_errors = self.df_bench[self.df_bench["method"] == method]["err"].values
+            if len(method_errors) != len(best_errors) or len(method_errors) == 0:
+                print(f"  {method[:23].ljust(25)}数据量不匹配，跳过")
+                continue
+            t_stat, p_val = stats.ttest_rel(np.abs(method_errors), np.abs(best_errors))
+            mean_diff = np.abs(method_errors).mean() - np.abs(best_errors).mean()
+            sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "n.s."
+            print(
+                f"  {method[:23].ljust(25)}{mean_diff:+8.4f}  {t_stat:9.3f}  {p_val:7.4f}  {sig}"
+            )
+
+    def _print_scenario_robustness(self, methods: List[str]) -> None:
+        if "scenario" not in self.df_bench.columns:
+            return
+
+        print("\n【3️⃣ 场景鲁棒性分析】")
+        scenarios = self.df_bench["scenario"].unique()
+
+        for method in methods:
+            df_m = self.df_bench[self.df_bench["method"] == method]
+            scenario_rmses = []
+            for scenario in scenarios:
+                df_s = df_m[df_m["scenario"] == scenario]
+                if len(df_s) > 0:
+                    scenario_rmses.append(np.sqrt(df_s["sq_err"].mean()))
+
+            if not scenario_rmses:
+                continue
+
+            rmse_std = float(np.std(scenario_rmses))
+            best_idx = int(np.argmin(scenario_rmses))
+            worst_idx = int(np.argmax(scenario_rmses))
+            best_scenario = scenarios[best_idx]
+            worst_scenario = scenarios[worst_idx]
+
+            print(f"\n  {method}:")
+            print(f"    跨场景RMSE标准差: {rmse_std:.4f} {'✓ 稳定' if rmse_std < 0.5 else '⚠️ 波动大'}")
+            print(f"    最佳场景: {best_scenario[:40]}")
+            print(f"    最差场景: {worst_scenario[:40]}")
+
+    def _print_representation_methods_analysis(self) -> None:
+        print("\n【4️⃣ 表征学习方法专项分析】")
+
+        rep_methods: List[str] = []
+        for method in self.df_bench["method"].unique():
+            df_m = self.df_bench[self.df_bench["method"] == method]
+            if "rep_auc_z_to_a" in df_m.columns and df_m["rep_auc_z_to_a"].notna().any():
+                rep_methods.append(method)
+
+        if not rep_methods:
+            print("  ℹ️ 无表征学习方法")
+            return
+
+        print("  方法".ljust(25) + "Z→A   W→A   Z→Y泄露  [X,W,A]→Y  质量分")
+        print("  " + "-" * 70)
+
+        for method in rep_methods:
+            df_m = self.df_bench[self.df_bench["method"] == method]
+            z_auc = df_m["rep_auc_z_to_a"].mean()
+            w_auc = df_m["rep_auc_w_to_a"].mean()
+            z_leak = df_m["rep_exclusion_leakage_r2"].mean()
+            y_r2 = df_m["rep_r2_xw_a_to_y"].mean()
+            qual = df_m["quality_score"].mean()
+
+            z_mark = "✓" if z_auc > 0.7 else "⚠️" if z_auc > 0.6 else "✗"
+            w_mark = "✓" if 0.45 < w_auc < 0.55 else "⚠️"
+            leak_mark = "✓" if z_leak < 0.1 else "⚠️" if z_leak < 0.2 else "✗"
+            y_mark = "✓" if y_r2 > 0.3 else "✗"
+
+            print(
+                f"  {method[:23].ljust(25)}{z_auc:.2f}{z_mark}  {w_auc:.2f}{w_mark}  "
+                f"{z_leak:.2f}{leak_mark}     {y_r2:.2f}{y_mark}      {qual:.1f}/4"
+            )
+
+        print("\n  图例: Z→A(IV强度应>0.7) | W→A(独立性应≈0.5) | Z→Y泄露(应<0.1) | [X,W,A]→Y(应>0.3)")
+
+    def _print_efficiency_tradeoff(self, methods: List[str]) -> None:
+        print("\n【5️⃣ 效率-精度权衡】")
+
+        data: List[Dict[str, float]] = []
+        for method in methods:
+            df_m = self.df_summary[self.df_summary["method"] == method]
+            data.append({"method": method, "rmse": df_m["rmse"].mean(), "runtime": df_m["mean_runtime"].mean()})
+
+        df_eff = pd.DataFrame(data)
+        if df_eff.empty or df_eff["rmse"].nunique() == 1 or df_eff["runtime"].nunique() == 1:
+            print("  ℹ️ 数据不足以计算效率得分")
+            return
+
+        df_eff["rmse_norm"] = (df_eff["rmse"] - df_eff["rmse"].min()) / (df_eff["rmse"].max() - df_eff["rmse"].min())
+        df_eff["runtime_norm"] = (df_eff["runtime"] - df_eff["runtime"].min()) / (
+            df_eff["runtime"].max() - df_eff["runtime"].min()
+        )
+        df_eff["efficiency_score"] = (1 - df_eff["rmse_norm"]) - 0.3 * df_eff["runtime_norm"]
+        df_eff = df_eff.sort_values("efficiency_score", ascending=False)
+
+        print("  方法".ljust(25) + "RMSE    运行时间  效率得分  推荐场景")
+        print("  " + "-" * 75)
+        for _, row in df_eff.iterrows():
+            if row["runtime"] < 0.1:
+                scenario = "实时推理"
+            elif row["runtime"] < 5:
+                scenario = "在线学习"
+            else:
+                scenario = "离线训练"
+            print(
+                f"  {row['method'][:23].ljust(25)}{row['rmse']:6.3f}  {row['runtime']:8.2f}s  "
+                f"{row['efficiency_score']:8.3f}  {scenario}"
+            )
 
 
 class IVAPCIv22Analyzer:
@@ -473,6 +670,8 @@ class IVAPCIv22Analyzer:
     # ---------------- full pipeline ----------------
     def full_analysis(self) -> None:
         self.executive_summary()
+        # 方法级对比
+        MethodComparison(self.df_bench, self.df_summary).comprehensive_method_comparison()
         self.identifiability_analysis()
         self.representation_quality_analysis()
         self.propensity_overlap_analysis()
