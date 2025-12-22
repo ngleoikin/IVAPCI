@@ -867,12 +867,12 @@ def main() -> None:
     parser.add_argument("--sampler", choices=["tpe", "nsga2"], default="tpe")
     parser.add_argument("--pruner", choices=["median", "hyperband", "none"], default="median")
     parser.add_argument("--agg", choices=["median", "mean"], default="median", help="repeat-level aggregation")
-    parser.add_argument("--w-auc-hinge", "--w-auc-thr", dest="w_auc_hinge", type=float, default=0.58, help="W→A AUC hinge threshold")
+    parser.add_argument("--w-auc-hinge", "--w-auc-thr", dest="w_auc_hinge", type=float, default=0.55, help="W→A AUC hinge threshold")
     parser.add_argument("--w-auc-feasible", type=float, default=0.56, help="W→A feasibility upper bound")
-    parser.add_argument("--z-r2-hinge", "--z-r2-thr", dest="z_r2_hinge", type=float, default=0.08, help="Z→Y leakage hinge R2")
-    parser.add_argument("--z-r2-feasible", type=float, default=0.05, help="Z→Y feasibility R2 upper bound")
-    parser.add_argument("--ess-ratio-target", type=float, default=0.35, help="Minimum ESS ratio target (hinge)")
-    parser.add_argument("--ess-ratio-feasible", type=float, default=0.40, help="ESS feasibility floor")
+    parser.add_argument("--z-r2-hinge", "--z-r2-thr", dest="z_r2_hinge", type=float, default=0.04, help="Z→Y leakage hinge R2")
+    parser.add_argument("--z-r2-feasible", type=float, default=0.06, help="Z→Y feasibility R2 upper bound")
+    parser.add_argument("--ess-ratio-target", type=float, default=0.38, help="Minimum ESS ratio target (hinge)")
+    parser.add_argument("--ess-ratio-feasible", type=float, default=0.35, help="ESS feasibility floor")
     parser.add_argument("--ate-scale", choices=["y_std", "y_mad", "tau_abs"], default="y_std", help="normalize ATE error")
     parser.add_argument("--plateau-window", type=int, default=25, help="Plateau detection window (trials)")
     parser.add_argument("--plateau-rel-impr", type=float, default=0.003, help="Relative improvement threshold for plateau stop")
@@ -884,6 +884,21 @@ def main() -> None:
     parser.add_argument("--quiet", action="store_true")
 
     args = parser.parse_args()
+
+    # Threshold direction sanity: hinge should be stricter than feasible for
+    # "smaller is better" metrics, and looser for "larger is better" metrics.
+    if args.w_auc_hinge > args.w_auc_feasible:
+        raise ValueError(
+            f"Invalid W thresholds: hinge({args.w_auc_hinge}) > feasible({args.w_auc_feasible})."
+        )
+    if args.z_r2_hinge > args.z_r2_feasible:
+        raise ValueError(
+            f"Invalid Z thresholds: hinge({args.z_r2_hinge}) > feasible({args.z_r2_feasible})."
+        )
+    if args.ess_ratio_target < args.ess_ratio_feasible:
+        raise ValueError(
+            f"Invalid ESS thresholds: target({args.ess_ratio_target}) < feasible({args.ess_ratio_feasible})."
+        )
 
     if args.multiobjective:
         args.objective_mode = "pareto"
@@ -1005,9 +1020,9 @@ def main() -> None:
         if objective_mode == "pareto":
             return (
                 m["ate_err"],
-                m["w_violation"],
-                m["z_violation"],
-                m["ess_violation"],
+                m["w_auc_eff"],
+                m["z_r2"],
+                -m["ess_ratio"],
             )
 
         return composite_score_from_scenarios(
