@@ -520,6 +520,18 @@ def run_one_fit(
     z_violation = max(0.0, float(z_r2) - float(z_r2_hinge))
     ess_violation = max(0.0, float(ess_ratio_target) - float(ess_ratio))
 
+    # Sanity checks: violations must be zero when metrics are within hinge/target.
+    if z_r2 <= float(z_r2_hinge) + 1e-12 and z_violation > 1e-9:
+        raise RuntimeError(
+            f"z_violation inconsistent with hinge: z_r2={z_r2}, hinge={z_r2_hinge}, viol={z_violation}, "
+            f"scenario={scenario_name}, seed={seed}, base_seed={base_seed}, rep={rep}"
+        )
+    if ess_ratio >= float(ess_ratio_target) - 1e-12 and ess_violation > 1e-9:
+        raise RuntimeError(
+            f"ess_violation inconsistent with target: ess_ratio={ess_ratio}, target={ess_ratio_target}, "
+            f"viol={ess_violation}, scenario={scenario_name}, seed={seed}, base_seed={base_seed}, rep={rep}"
+        )
+
     return {
         "status": "success",
         "scenario": scenario_name,
