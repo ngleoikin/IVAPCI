@@ -417,11 +417,16 @@ def _ess_ratio_from_diag(diag: Dict[str, Any], n: int) -> float:
     ess = safe_float(diag.get("overlap_ess_min", np.nan))
     if not np.isfinite(ess):
         ess = safe_float(diag.get("dr_ess_min", np.nan))
-        if np.isfinite(ess) and n > 0 and ess > 1.0:
-            ess = ess / float(n)
+
+    # Guard against diagnostics that return absolute ESS instead of ratio.
+    if np.isfinite(ess) and n > 0 and ess > 1.0:
+        ess = ess / float(n)
+
     if not np.isfinite(ess):
         ess = 0.0
-    return float(ess)
+
+    # Clip to a sensible ratio range to avoid runaway penalties.
+    return float(np.clip(ess, 0.0, 1.0))
 
 
 def _y_scale(Y: np.ndarray, tau_true: float, mode: str) -> float:
@@ -512,7 +517,8 @@ def run_one_fit(
     )
     if not np.isfinite(z_r2):
         z_r2 = 0.0
-    z_leak = max(0.0, float(z_r2))
+    z_r2 = max(0.0, float(z_r2))
+    z_leak = z_r2
 
     ess_ratio = _ess_ratio_from_diag(diag, n)
 
@@ -521,6 +527,11 @@ def run_one_fit(
     ess_violation = max(0.0, float(ess_ratio_target) - float(ess_ratio))
 
     # Sanity checks: violations must be zero when metrics are within hinge/target.
+    if w_auc_eff <= float(w_auc_hinge) + 1e-12 and w_violation > 1e-9:
+        raise RuntimeError(
+            f"w_violation inconsistent with hinge: w_auc_eff={w_auc_eff}, hinge={w_auc_hinge}, "
+            f"viol={w_violation}, scenario={scenario_name}, seed={seed}, base_seed={base_seed}, rep={rep}"
+        )
     if z_r2 <= float(z_r2_hinge) + 1e-12 and z_violation > 1e-9:
         raise RuntimeError(
             f"z_violation inconsistent with hinge: z_r2={z_r2}, hinge={z_r2_hinge}, viol={z_violation}, "
@@ -778,6 +789,56 @@ def composite_score_from_scenarios(
     return float(sum(w * l for w, l in weighted) / w_sum)
 
 
+def _load_scenario_stats(trial: optuna.trial.FrozenTrial) -> List[Dict[str, Any]]:
+    raw = trial.user_attrs.get("scenario_stats") or trial.user_attrs.get("scenario_stats_json")
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    try:
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
+def _trial_metrics(trial: optuna.trial.FrozenTrial) -> Dict[str, float]:
+    ua = trial.user_attrs
+    return {
+        "ate_err": safe_float(ua.get("mean_ate_err", np.nan)),
+        "w_auc_eff": safe_float(ua.get("mean_w_auc_eff", ua.get("mean_w_auc", np.nan))),
+        "z_r2": max(0.0, safe_float(ua.get("mean_z_r2", np.nan))),
+        "ess_ratio": safe_float(ua.get("mean_ess_ratio", np.nan)),
+    }
+
+
+def _is_feasible_trial(
+    trial: optuna.trial.FrozenTrial,
+    *,
+    w_auc_feasible: float,
+    z_r2_feasible: float,
+    ess_ratio_feasible: float,
+) -> bool:
+    sc_stats = _load_scenario_stats(trial)
+    if sc_stats:
+        for s in sc_stats:
+            w_auc_eff = safe_float(s.get("w_auc_eff", np.nan))
+            z_r2 = max(0.0, safe_float(s.get("z_r2", np.nan)))
+            ess_ratio = safe_float(s.get("ess_ratio", np.nan))
+            if not np.isfinite([w_auc_eff, z_r2, ess_ratio]).all():
+                return False
+            if (w_auc_eff > w_auc_feasible) or (z_r2 > z_r2_feasible) or (ess_ratio < ess_ratio_feasible):
+                return False
+        return True
+
+    met = _trial_metrics(trial)
+    return bool(
+        np.isfinite(list(met.values())).all()
+        and (met["w_auc_eff"] <= w_auc_feasible)
+        and (met["z_r2"] <= z_r2_feasible)
+        and (met["ess_ratio"] >= ess_ratio_feasible)
+    )
+
+
 # -------------------- 主程序 --------------------
 
 def main() -> None:
@@ -939,6 +1000,7 @@ def main() -> None:
         trial.set_user_attr("mean_ess_ratio", m["ess_ratio"])
         trial.set_user_attr("mean_train_time", m["train_time"])
         trial.set_user_attr("scenario_stats", json.dumps(sc_stats))
+        trial.set_user_attr("scenario_stats_json", json.dumps(sc_stats))
 
         if objective_mode == "pareto":
             return (
@@ -1053,14 +1115,21 @@ def main() -> None:
         feasible: List[Dict[str, Any]] = []
         completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
         for t in completed:
-            met = _metric_from_trial(t)
-            if (
-                np.isfinite(list(met.values())).all()
-                and met["w_auc_eff"] <= args.w_auc_feasible
-                and met["z_r2"] <= args.z_r2_feasible
-                and met["ess_ratio"] >= args.ess_ratio_feasible
+            if _is_feasible_trial(
+                t,
+                w_auc_feasible=args.w_auc_feasible,
+                z_r2_feasible=args.z_r2_feasible,
+                ess_ratio_feasible=args.ess_ratio_feasible,
             ):
-                feasible.append({"trial": t.number, "params": t.params, "metrics": met, "user_attrs": dict(t.user_attrs)})
+                feasible.append(
+                    {
+                        "trial": t.number,
+                        "params": t.params,
+                        "metrics": _trial_metrics(t),
+                        "scenario_stats": _load_scenario_stats(t),
+                        "user_attrs": dict(t.user_attrs),
+                    }
+                )
 
         recommended: Dict[str, Any]
         if feasible:
@@ -1070,7 +1139,7 @@ def main() -> None:
         else:
             fallback: List[Dict[str, Any]] = []
             for t in completed:
-                met = _metric_from_trial(t)
+                met = _trial_metrics(t)
                 if not np.isfinite(list(met.values())).all():
                     continue
                 fallback.append(
@@ -1079,6 +1148,7 @@ def main() -> None:
                         "params": t.params,
                         "user_attrs": dict(t.user_attrs),
                         "metrics": met,
+                        "scenario_stats": _load_scenario_stats(t),
                         "violation": max(0.0, met["w_auc_eff"] - args.w_auc_feasible)
                         + max(0.0, met["z_r2"] - args.z_r2_feasible)
                         + max(0.0, args.ess_ratio_feasible - met["ess_ratio"]),
