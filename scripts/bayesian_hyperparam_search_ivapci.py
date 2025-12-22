@@ -349,10 +349,6 @@ def define_params(trial: optuna.trial.Trial, mode: str) -> Dict[str, Any]:
             "gamma_adv_z": 0.18,
             "dropout_z": 0.30,
             "enc_z_hidden": "32-16",
-
-            "ctrl_w_auc_target": trial.suggest_float("ctrl_w_auc_target", 0.52, 0.55),
-            "ctrl_kp_w": trial.suggest_float("ctrl_kp_w", 1.8, 3.0),
-            "ctrl_ki_w": trial.suggest_float("ctrl_ki_w", 0.45, 0.75),
         }
 
     if mode == "balanced":
@@ -372,12 +368,6 @@ def define_params(trial: optuna.trial.Trial, mode: str) -> Dict[str, Any]:
             # orthogonal
             "lambda_cond_ortho": trial.suggest_float("lambda_cond_ortho", 0.004, 0.03, log=True),
             "cond_ortho_warmup_epochs": trial.suggest_int("cond_ortho_warmup_epochs", 3, 10),
-
-            # controller
-            "ctrl_w_auc_target": trial.suggest_float("ctrl_w_auc_target", 0.52, 0.55),
-            "ctrl_kp_w": trial.suggest_float("ctrl_kp_w", 1.8, 3.2),
-            "ctrl_ki_w": trial.suggest_float("ctrl_ki_w", 0.45, 0.80),
-            "ctrl_z_r2_target": trial.suggest_float("ctrl_z_r2_target", 0.08, 0.14),
         }
 
     if mode == "focused_w":
@@ -387,11 +377,6 @@ def define_params(trial: optuna.trial.Trial, mode: str) -> Dict[str, Any]:
             "gamma_adv_w_cond": trial.suggest_float("gamma_adv_w_cond", 0.15, 0.30),
             "lambda_hsic": trial.suggest_float("lambda_hsic", 0.04, 0.18, log=True),
             "lambda_hsic_w_a": trial.suggest_float("lambda_hsic_w_a", 0.02, 0.14),
-
-            # controller W
-            "ctrl_w_auc_target": trial.suggest_float("ctrl_w_auc_target", 0.51, 0.55),
-            "ctrl_kp_w": trial.suggest_float("ctrl_kp_w", 2.0, 3.5),
-            "ctrl_ki_w": trial.suggest_float("ctrl_ki_w", 0.45, 0.85),
 
             # Z fixed
             "gamma_adv_z": 0.18,
@@ -485,7 +470,11 @@ def run_one_fit(
         cfg.epochs_pretrain = int(pretrain_epochs)
 
     for k, v in cfg_overrides.items():
+        if not hasattr(cfg, k):
+            raise AttributeError(f"Config has no attribute '{k}' to tune; update search space or config.")
         setattr(cfg, k, parse_hidden_spec(v))
+        if hasattr(cfg, "_user_overrides"):
+            cfg._user_overrides.add(k)
 
     t0 = time.time()
     est = Est(config=cfg)

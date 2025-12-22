@@ -72,11 +72,6 @@ SEARCH_SPACES: Dict[str, Dict[str, List[Any]]] = {
         "gamma_adv_z": [0.18],
         "dropout_z": [0.30],
         "enc_z_hidden": ["32-16"],
-
-        # 🟢 控制器（固定较稳的目标；0.51 太狠，容易长期饱和）
-        "ctrl_w_auc_target": [0.54],
-        "ctrl_kp_w": [2.2],
-        "ctrl_ki_w": [0.55],
     },
     "balanced": {
         # W 独立性
@@ -94,12 +89,6 @@ SEARCH_SPACES: Dict[str, Dict[str, List[Any]]] = {
         # 条件正交（略早、略强）
         "lambda_cond_ortho": [0.008, 0.012, 0.015],
         "cond_ortho_warmup_epochs": [5, 8],
-
-        # 控制器
-        "ctrl_w_auc_target": [0.53, 0.54],
-        "ctrl_kp_w": [2.0, 2.2],
-        "ctrl_ki_w": [0.50, 0.55],
-        "ctrl_z_r2_target": [0.10, 0.12],
     },
     "focused_w": {
         # 密集搜索 W
@@ -107,11 +96,6 @@ SEARCH_SPACES: Dict[str, Dict[str, List[Any]]] = {
         "gamma_adv_w_cond": [0.16, 0.18, 0.20, 0.22],
         "lambda_hsic": [0.05, 0.07, 0.09, 0.11],
         "lambda_hsic_w_a": [0.03, 0.05, 0.07, 0.09],
-
-        # 控制器 W
-        "ctrl_w_auc_target": [0.52, 0.53, 0.54],
-        "ctrl_kp_w": [2.1, 2.3, 2.5],
-        "ctrl_ki_w": [0.50, 0.55, 0.60],
 
         # Z 固定（避免扩大搜索维度）
         "gamma_adv_z": [0.18],
@@ -428,7 +412,11 @@ class HyperparameterSearchRunner:
 
         cfg = copy.deepcopy(base_cfg)
         for k, v in params.items():
+            if not hasattr(cfg, k):
+                raise AttributeError(f"Config has no attribute '{k}' to tune; search space should be updated.")
             setattr(cfg, k, _parse_hidden_spec(v))
+            if hasattr(cfg, "_user_overrides"):
+                cfg._user_overrides.add(k)
 
         cfg.epochs_main = self.epochs_main
         if self.epochs_pretrain is not None:

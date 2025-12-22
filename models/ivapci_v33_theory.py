@@ -1,7 +1,7 @@
 """IVAPCI v3.3 (TheoryComplete): hierarchical encoder + theorem-aware extras."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, field, fields
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
@@ -496,53 +496,210 @@ class IVAPCIV33TheoryConfig:
     n_samples_hint: Optional[int] = None
     adaptive: bool = True
 
-    def apply_theorem45_defaults(self) -> "IVAPCIV33TheoryConfig":
+    # Tracks upstream-specified hyperparameters so adaptive defaults do not overwrite them
+    _user_overrides: set[str] = field(default_factory=set, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Mark fields explicitly set away from defaults as overrides."""
+        for f in fields(self):
+            if not f.init or f.name.startswith("_"):
+                continue
+            try:
+                current = getattr(self, f.name)
+            except Exception:
+                continue
+            default_val = None
+            if f.default is not MISSING:
+                default_val = f.default
+            elif f.default_factory is not MISSING:  # type: ignore[attr-defined]
+                try:
+                    default_val = f.default_factory()  # type: ignore[misc]
+                except Exception:
+                    default_val = None
+            # Only mark overrides when the value differs from the dataclass default
+            if default_val is not None and current != default_val:
+                self._user_overrides.add(f.name)
+
+    def apply_theorem45_defaults(self, *, overwrite: bool = False) -> "IVAPCIV33TheoryConfig":
         n = self.n_samples_hint
         if (not self.adaptive) or (n is None) or (n <= 0):
             return self
+        
+        def _maybe_set(name: str, value: float | int) -> None:
+            if overwrite or name not in self._user_overrides:
+                setattr(self, name, value)
         base = max(6, int(2 * np.log1p(n)))
-        self.latent_x_dim = max(2, base // 3)
-        self.latent_w_dim = max(2, base // 3)
-        self.latent_z_dim = max(2, base // 6)
-        self.latent_n_dim = max(2, base // 3)
+        _maybe_set("latent_x_dim", max(2, base // 3))
+        _maybe_set("latent_w_dim", max(2, base // 3))
+        _maybe_set("latent_z_dim", max(2, base // 6))
+        _maybe_set("latent_n_dim", max(2, base // 3))
 
         ortho_scale = 0.005 * np.sqrt(np.log1p(n))
-        self.lambda_ortho = float(max(self.lambda_ortho, ortho_scale))
-        self.lambda_consistency = 0.04 * np.sqrt(np.log1p(n))
+        _maybe_set("lambda_ortho", float(max(self.lambda_ortho, ortho_scale)))
+        _maybe_set("lambda_consistency", 0.04 * np.sqrt(np.log1p(n)))
 
         decay = 1.0 / np.sqrt(np.log1p(n))
         scale_decay = min(1.0, 1.5 * decay)
         base_gamma_w = getattr(self, "gamma_adv_w", 2.0)
         base_gamma_z = getattr(self, "gamma_adv_z", 1.5)
         base_gamma_n = getattr(self, "gamma_adv_n", 0.1)
-        self.gamma_adv_w = float(max(0.5, base_gamma_w * scale_decay))
-        self.gamma_adv_z = float(max(0.5, base_gamma_z * scale_decay))
-        self.gamma_adv_n = float(max(0.05, base_gamma_n * scale_decay))
+        _maybe_set("gamma_adv_w", float(max(0.5, base_gamma_w * scale_decay)))
+        _maybe_set("gamma_adv_z", float(max(0.5, base_gamma_z * scale_decay)))
+        _maybe_set("gamma_adv_n", float(max(0.05, base_gamma_n * scale_decay)))
 
-        self.gamma_padic = 0.001 * np.sqrt(np.log1p(n))
-        self.min_std = max(1e-4, 1e-2 / np.sqrt(np.log1p(n)))
-        self.low_var_min_std = min(self.low_var_min_std, self.min_std * 0.1)
+        _maybe_set("gamma_padic", 0.001 * np.sqrt(np.log1p(n)))
+        _maybe_set("min_std", max(1e-4, 1e-2 / np.sqrt(np.log1p(n))))
+        _maybe_set("low_var_min_std", min(self.low_var_min_std, self.min_std * 0.1))
 
-        self.epochs_pretrain = int(min(80, 30 + 10 * np.log1p(n / 500)))
-        self.epochs_main = int(min(220, 100 + 15 * np.log1p(n / 500)))
+        _maybe_set("epochs_pretrain", int(min(80, 30 + 10 * np.log1p(n / 500))))
+        _maybe_set("epochs_main", int(min(220, 100 + 15 * np.log1p(n / 500))))
         # ---------- Overlap / ESS targets (Theorem 5 bias–variance trade-off) ----------
         # Keep training ESS targets conservative on small n to avoid aggressive clipping.
         if getattr(self, "ess_target_train", None) is None:
             r = float(np.log1p(n) / max(1e-6, np.log1p(2000.0)))
             # more conservative training ESS to avoid aggressive clipping on small n
-            self.ess_target_train = float(np.clip(0.20 + 0.15 * r, 0.20, 0.45))
-        self.ess_target = float(np.clip(self.ess_target_train + 0.05, 0.25, 0.55))
+            _maybe_set("ess_target_train", float(np.clip(0.20 + 0.15 * r, 0.20, 0.45)))
+        _maybe_set("ess_target", float(np.clip(self.ess_target_train + 0.05, 0.25, 0.55)))
 
         # Allow adaptive clipping to select the minimum threshold that reaches ESS goals.
-        self.clip_prop = float(min(self.clip_prop, 0.01))
-        self.clip_prop_adaptive_max = float(max(self.clip_prop_adaptive_max, 0.05))
+        _maybe_set("clip_prop", float(min(self.clip_prop, 0.01)))
+        _maybe_set("clip_prop_adaptive_max", float(max(self.clip_prop_adaptive_max, 0.05)))
 
         # Adversary steps: small datasets benefit from a couple of extra discriminator steps.
         if n <= 800:
-            self.adv_steps = int(max(self.adv_steps_min, min(self.adv_steps_max, max(2, self.adv_steps))))
+            _maybe_set("adv_steps", int(max(self.adv_steps_min, min(self.adv_steps_max, max(2, self.adv_steps)))))
         else:
-            self.adv_steps = int(max(self.adv_steps_min, min(self.adv_steps_max, self.adv_steps)))
+            _maybe_set("adv_steps", int(max(self.adv_steps_min, min(self.adv_steps_max, self.adv_steps))))
         return self
+
+
+def adaptive_regularization_schedule(
+    epoch: int,
+    total_epochs: int,
+    diagnostics: dict,
+    config: IVAPCIV33TheoryConfig,
+) -> tuple[float, float, float]:
+    """Dynamic adjustment of adversarial and HSIC weights.
+
+    Balances Theorem 2 (information preservation) and Theorem 3 (exclusion/independence)
+    with a gentle phase schedule:
+    - Early phase: looser constraints for expressiveness
+    - Mid phase: nominal weights
+    - Late phase: slightly stronger constraints to tighten identifiability
+    Diagnostic cues allow reacting to W→A leakage and Z-exclusion leakage.
+    Returns (gamma_adv_w, gamma_adv_z, lambda_hsic).
+    """
+
+    base_w = config.gamma_adv_w
+    base_z = config.gamma_adv_z
+    base_hsic = config.lambda_hsic
+
+    if epoch < total_epochs * 0.3:
+        phase_scale = 0.7
+    elif epoch < total_epochs * 0.7:
+        phase_scale = 1.0
+    else:
+        phase_scale = 1.2
+
+    info_loss = diagnostics.get("info_loss_proxy", 0.015)
+    if info_loss > 0.018:
+        info_scale = 0.8
+    elif info_loss < 0.014:
+        info_scale = 1.1
+    else:
+        info_scale = 1.0
+
+    w_auc = diagnostics.get("rep_auc_w_to_a", 0.5)
+    w_dev = abs(w_auc - 0.5)
+    if w_dev > 0.18:
+        w_boost = 1.5
+    elif w_dev > 0.12:
+        w_boost = 1.2
+    elif w_dev < 0.08:
+        w_boost = 0.9
+    else:
+        w_boost = 1.0
+
+    z_leak = diagnostics.get("rep_exclusion_leakage_r2", 0.15)
+    if z_leak > 0.20:
+        z_boost = 1.5
+    elif z_leak > 0.15:
+        z_boost = 1.2
+    elif z_leak < 0.10:
+        z_boost = 0.9
+    else:
+        z_boost = 1.0
+
+    gamma_w = base_w * phase_scale * info_scale * w_boost
+    gamma_z = base_z * phase_scale * info_scale * z_boost
+    lambda_h = base_hsic * phase_scale * info_scale
+
+    gamma_w = float(np.clip(gamma_w, 0.05, 0.4))
+    gamma_z = float(np.clip(gamma_z, 0.05, 0.3))
+    lambda_h = float(np.clip(lambda_h, 0.005, 0.10))
+
+    return gamma_w, gamma_z, lambda_h
+
+
+class SmartAdversarialScheduler:
+    """Warmup + cosine ramp + feedback scheduler for adversarial strengths."""
+
+    def __init__(
+        self,
+        base_gamma_w: float,
+        base_gamma_z: float,
+        warmup_epochs: int = 10,
+        ramp_epochs: int = 30,
+        target_w_auc: float = 0.5,
+        target_z_r2: float = 0.1,
+    ) -> None:
+        self.base_gamma_w = base_gamma_w
+        self.base_gamma_z = base_gamma_z
+        self.warmup = warmup_epochs
+        self.ramp = ramp_epochs
+        self.target_w_auc = target_w_auc
+        self.target_z_r2 = target_z_r2
+
+    def step(self, epoch: int, total_epochs: int, diagnostics: dict) -> tuple[float, float]:
+        import numpy as _np
+
+        if epoch < self.warmup:
+            return 0.0, 0.0
+
+        if epoch < self.warmup + self.ramp:
+            prog = (epoch - self.warmup) / max(1, self.ramp)
+            ramp_factor = 0.5 * (1 - _np.cos(_np.pi * prog))
+        else:
+            ramp_factor = 1.0
+
+        base_w = self.base_gamma_w * ramp_factor
+        base_z = self.base_gamma_z * ramp_factor
+
+        w_auc = float(diagnostics.get("rep_auc_w_to_a", 0.5))
+        z_r2 = float(diagnostics.get("rep_exclusion_leakage_r2", 0.0))
+
+        w_dev = abs(w_auc - self.target_w_auc)
+        if w_dev > 0.15:
+            w_mult = 1.3
+        elif w_dev > 0.08:
+            w_mult = 1.1
+        elif w_dev < 0.05:
+            w_mult = 0.9
+        else:
+            w_mult = 1.0
+
+        if z_r2 > 0.18:
+            z_mult = 1.3
+        elif z_r2 > 0.12:
+            z_mult = 1.1
+        elif z_r2 < 0.08:
+            z_mult = 0.9
+        else:
+            z_mult = 1.0
+
+        gamma_w = float(_np.clip(base_w * w_mult, 0.0, 0.4))
+        gamma_z = float(_np.clip(base_z * z_mult, 0.0, 0.3))
+        return gamma_w, gamma_z
 
 
 def adaptive_regularization_schedule(
@@ -684,7 +841,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
     def __init__(self, config: Optional[IVAPCIV33TheoryConfig] = None):
         self.config = config or IVAPCIV33TheoryConfig()
         if self.config.n_samples_hint is not None:
-            self.config.apply_theorem45_defaults()
+            self.config.apply_theorem45_defaults(overwrite=False)
         self.device = torch.device(self.config.device)
         torch.manual_seed(self.config.seed)
         np.random.seed(self.config.seed)
@@ -1033,7 +1190,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
         if cfg.n_samples_hint is None:
             cfg.n_samples_hint = int(n)
             if cfg.adaptive:
-                cfg.apply_theorem45_defaults()
+                cfg.apply_theorem45_defaults(overwrite=False)
 
         # Pre-training identifiability checks (lightweight proxies)
         self._identifiability_checks(V_all, A, Y)
