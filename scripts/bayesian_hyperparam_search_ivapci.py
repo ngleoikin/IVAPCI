@@ -870,6 +870,11 @@ def main() -> None:
     parser.add_argument("--val-repeats", type=int, default=10, help="Validation runs per scenario (distinct seeds)")
     parser.add_argument("--val-seed-offset", type=int, default=10_000, help="Offset applied to validation seeds")
     parser.add_argument("--val-scenarios", type=str, default=None, help="Optional holdout scenarios for validation (comma/space)")
+    parser.add_argument(
+        "--no-dynamic-feedback",
+        action="store_true",
+        help="Disable all diagnostic-driven schedules inside training (keep sampled hyperparameters fixed).",
+    )
     parser.add_argument("--quiet", action="store_true")
 
     args = parser.parse_args()
@@ -944,6 +949,11 @@ def main() -> None:
 
     def objective(trial: optuna.trial.Trial):
         params = define_params(trial, args.mode)
+        if args.no_dynamic_feedback:
+            params = dict(params)
+            params["dynamic_feedback"] = False
+            params.setdefault("adaptive", False)
+            params.setdefault("adv_steps_dynamic", False)
         all_rows: List[Dict[str, Any]] = []
         step = 0
 

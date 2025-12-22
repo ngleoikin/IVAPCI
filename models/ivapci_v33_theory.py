@@ -443,6 +443,8 @@ class IVAPCIV33TheoryConfig:
     adv_steps_min: int = 1
     adv_steps_max: int = 5
     adv_steps_dynamic: bool = True  # adapt adversary steps based on leakage diagnostics
+    # Master switch to disable all diagnostic-driven feedback (keeps Optuna/base params fixed).
+    dynamic_feedback: bool = True
     adv_warmup_epochs: int = 10
     adv_ramp_epochs: int = 30
     gamma_padic: float = 1e-3
@@ -571,135 +573,6 @@ class IVAPCIV33TheoryConfig:
         else:
             _maybe_set("adv_steps", int(max(self.adv_steps_min, min(self.adv_steps_max, self.adv_steps))))
         return self
-
-
-def adaptive_regularization_schedule(
-    epoch: int,
-    total_epochs: int,
-    diagnostics: dict,
-    config: IVAPCIV33TheoryConfig,
-) -> tuple[float, float, float]:
-    """Dynamic adjustment of adversarial and HSIC weights.
-
-    Balances Theorem 2 (information preservation) and Theorem 3 (exclusion/independence)
-    with a gentle phase schedule:
-    - Early phase: looser constraints for expressiveness
-    - Mid phase: nominal weights
-    - Late phase: slightly stronger constraints to tighten identifiability
-    Diagnostic cues allow reacting to W→A leakage and Z-exclusion leakage.
-    Returns (gamma_adv_w, gamma_adv_z, lambda_hsic).
-    """
-
-    base_w = config.gamma_adv_w
-    base_z = config.gamma_adv_z
-    base_hsic = config.lambda_hsic
-
-    if epoch < total_epochs * 0.3:
-        phase_scale = 0.7
-    elif epoch < total_epochs * 0.7:
-        phase_scale = 1.0
-    else:
-        phase_scale = 1.2
-
-    info_loss = diagnostics.get("info_loss_proxy", 0.015)
-    if info_loss > 0.018:
-        info_scale = 0.8
-    elif info_loss < 0.014:
-        info_scale = 1.1
-    else:
-        info_scale = 1.0
-
-    w_auc = diagnostics.get("rep_auc_w_to_a", 0.5)
-    w_dev = abs(w_auc - 0.5)
-    if w_dev > 0.18:
-        w_boost = 1.5
-    elif w_dev > 0.12:
-        w_boost = 1.2
-    elif w_dev < 0.08:
-        w_boost = 0.9
-    else:
-        w_boost = 1.0
-
-    z_leak = diagnostics.get("rep_exclusion_leakage_r2", 0.15)
-    if z_leak > 0.20:
-        z_boost = 1.5
-    elif z_leak > 0.15:
-        z_boost = 1.2
-    elif z_leak < 0.10:
-        z_boost = 0.9
-    else:
-        z_boost = 1.0
-
-    gamma_w = base_w * phase_scale * info_scale * w_boost
-    gamma_z = base_z * phase_scale * info_scale * z_boost
-    lambda_h = base_hsic * phase_scale * info_scale
-
-    gamma_w = float(np.clip(gamma_w, 0.05, 0.4))
-    gamma_z = float(np.clip(gamma_z, 0.05, 0.3))
-    lambda_h = float(np.clip(lambda_h, 0.005, 0.10))
-
-    return gamma_w, gamma_z, lambda_h
-
-
-class SmartAdversarialScheduler:
-    """Warmup + cosine ramp + feedback scheduler for adversarial strengths."""
-
-    def __init__(
-        self,
-        base_gamma_w: float,
-        base_gamma_z: float,
-        warmup_epochs: int = 10,
-        ramp_epochs: int = 30,
-        target_w_auc: float = 0.5,
-        target_z_r2: float = 0.1,
-    ) -> None:
-        self.base_gamma_w = base_gamma_w
-        self.base_gamma_z = base_gamma_z
-        self.warmup = warmup_epochs
-        self.ramp = ramp_epochs
-        self.target_w_auc = target_w_auc
-        self.target_z_r2 = target_z_r2
-
-    def step(self, epoch: int, total_epochs: int, diagnostics: dict) -> tuple[float, float]:
-        import numpy as _np
-
-        if epoch < self.warmup:
-            return 0.0, 0.0
-
-        if epoch < self.warmup + self.ramp:
-            prog = (epoch - self.warmup) / max(1, self.ramp)
-            ramp_factor = 0.5 * (1 - _np.cos(_np.pi * prog))
-        else:
-            ramp_factor = 1.0
-
-        base_w = self.base_gamma_w * ramp_factor
-        base_z = self.base_gamma_z * ramp_factor
-
-        w_auc = float(diagnostics.get("rep_auc_w_to_a", 0.5))
-        z_r2 = float(diagnostics.get("rep_exclusion_leakage_r2", 0.0))
-
-        w_dev = abs(w_auc - self.target_w_auc)
-        if w_dev > 0.15:
-            w_mult = 1.3
-        elif w_dev > 0.08:
-            w_mult = 1.1
-        elif w_dev < 0.05:
-            w_mult = 0.9
-        else:
-            w_mult = 1.0
-
-        if z_r2 > 0.18:
-            z_mult = 1.3
-        elif z_r2 > 0.12:
-            z_mult = 1.1
-        elif z_r2 < 0.08:
-            z_mult = 0.9
-        else:
-            z_mult = 1.0
-
-        gamma_w = float(_np.clip(base_w * w_mult, 0.0, 0.4))
-        gamma_z = float(_np.clip(base_z * z_mult, 0.0, 0.3))
-        return gamma_w, gamma_z
 
 
 def adaptive_regularization_schedule(
@@ -1296,26 +1169,43 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             self.adv_w.train(); self.adv_z.train(); self.adv_n.train()
             self.adv_w_cond.train(); self.adv_z_cond.train(); self.adv_n_cond.train()
 
-            _, _, lambda_hsic_ep = adaptive_regularization_schedule(
-                epoch, cfg.epochs_main, getattr(self, "training_diagnostics", {}), cfg
-            )
-            gamma_w_use, gamma_z_use = self._adv_scheduler.step(
-                epoch, cfg.epochs_main, getattr(self, "training_diagnostics", {})
-            )
-            w_factor = gamma_w_use / max(cfg.gamma_adv_w, 1e-8)
-            z_factor = gamma_z_use / max(cfg.gamma_adv_z, 1e-8)
+            lambda_hsic_ep = float(cfg.lambda_hsic)
+            if cfg.dynamic_feedback:
+                _, _, lambda_hsic_ep = adaptive_regularization_schedule(
+                    epoch, cfg.epochs_main, getattr(self, "training_diagnostics", {}), cfg
+                )
+
+            gamma_w_use = float(cfg.gamma_adv_w)
+            gamma_z_use = float(cfg.gamma_adv_z)
+            gamma_n_use = float(cfg.gamma_adv_n)
+            gamma_w_cond = float(cfg.gamma_adv_w_cond)
+            gamma_z_cond = float(cfg.gamma_adv_z_cond)
+            gamma_n_cond = float(cfg.gamma_adv_n_cond)
+            w_factor = 1.0
+            z_factor = 1.0
             cond_factor = 0.0
             if epoch >= cfg.cond_adv_warmup_epochs:
                 cond_factor = float(
                     min(1.0, (epoch - cfg.cond_adv_warmup_epochs + 1) / max(1, cfg.cond_adv_ramp_epochs))
                 )
-            gamma_n_use = cfg.gamma_adv_n * w_factor
-            gamma_w_cond = cfg.gamma_adv_w_cond * w_factor * cond_factor
-            gamma_z_cond = cfg.gamma_adv_z_cond * z_factor * cond_factor
-            gamma_n_cond = cfg.gamma_adv_n_cond * w_factor * cond_factor
+            if cfg.dynamic_feedback:
+                gamma_w_use, gamma_z_use = self._adv_scheduler.step(
+                    epoch, cfg.epochs_main, getattr(self, "training_diagnostics", {})
+                )
+                w_factor = gamma_w_use / max(cfg.gamma_adv_w, 1e-8)
+                z_factor = gamma_z_use / max(cfg.gamma_adv_z, 1e-8)
+                gamma_n_use = cfg.gamma_adv_n * w_factor
+                gamma_w_cond = cfg.gamma_adv_w_cond * w_factor * cond_factor
+                gamma_z_cond = cfg.gamma_adv_z_cond * z_factor * cond_factor
+                gamma_n_cond = cfg.gamma_adv_n_cond * w_factor * cond_factor
+            else:
+                gamma_n_use = cfg.gamma_adv_n * w_factor
+                gamma_w_cond = cfg.gamma_adv_w_cond * w_factor * cond_factor
+                gamma_z_cond = cfg.gamma_adv_z_cond * z_factor * cond_factor
+                gamma_n_cond = cfg.gamma_adv_n_cond * w_factor * cond_factor
 
             adv_steps_ep = cfg.adv_steps
-            if cfg.adv_steps_dynamic:
+            if cfg.dynamic_feedback and cfg.adv_steps_dynamic:
                 diag_now = getattr(self, "training_diagnostics", {}) or {}
                 w_auc = float(diag_now.get("rep_auc_w_to_a", 0.5))
                 w_auc_eff = max(w_auc, 1.0 - w_auc)  # symmetric leakage measure
@@ -1434,7 +1324,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
                     )
 
                 lambda_overlap_ep = float(cfg.lambda_overlap)
-                if cfg.lambda_overlap > 0:
+                if cfg.dynamic_feedback and cfg.lambda_overlap > 0:
                     diag_now = getattr(self, "training_diagnostics", {}) or {}
                     ess_min = diag_now.get("overlap_ess_min")
                     ess_target_train = cfg.ess_target_train or 0.0
