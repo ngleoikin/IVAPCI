@@ -491,7 +491,7 @@ def run_one_fit(
     tau_true_f = float(tau_true)
     y_scale_val = _y_scale(Y, tau_true_f, ate_scale)
     abs_err = abs(ate_hat - tau_true_f)
-    rel_abs_err = abs_err / (abs(tau_true_f) + y_scale_val)
+    rel_abs_err = abs_err / (y_scale_val + 1e-8)
 
     try:
         diag = est.get_training_diagnostics()
@@ -720,9 +720,9 @@ def validate_best_config(
 def composite_score_from_scenarios(
     scenario_stats: List[Dict[str, Any]], *, w_auc_hinge: float, z_r2_hinge: float, ess_ratio_target: float
 ) -> float:
-    """Multiplicative objective that penalizes any violated condition.
+    """Log-sum objective that penalizes any violated condition.
 
-    L_s = (1 + L_ate) * (1 + 2*L_w) * (1 + 2*L_z) * (1 + L_ess)
+    L_s = log1p(ate) + log1p(2*w_term) + log1p(2*z_term) + log1p(ess_term)
     Global = Σ_s w_s * L_s / Σ_s w_s, with w_s = log1p(n_seeds).
     """
 
@@ -752,7 +752,12 @@ def composite_score_from_scenarios(
         if not np.isfinite(ess_term):
             ess_term = max(0.0, ess_ratio_target - ess_ratio) if np.isfinite(ess_ratio) else ess_ratio_target
 
-        loss_s = (1.0 + ate) * (1.0 + 2.0 * w_term) * (1.0 + 2.0 * z_term) * (1.0 + ess_term)
+        loss_s = (
+            np.log1p(ate)
+            + np.log1p(2.0 * w_term)
+            + np.log1p(2.0 * z_term)
+            + np.log1p(ess_term)
+        )
         weighted.append((weight, loss_s))
 
     w_sum = float(sum(w for w, _ in weighted))
@@ -789,12 +794,12 @@ def main() -> None:
     parser.add_argument("--sampler", choices=["tpe", "nsga2"], default="tpe")
     parser.add_argument("--pruner", choices=["median", "hyperband", "none"], default="median")
     parser.add_argument("--agg", choices=["median", "mean"], default="median", help="repeat-level aggregation")
-    parser.add_argument("--w-auc-hinge", "--w-auc-thr", dest="w_auc_hinge", type=float, default=0.55, help="W→A AUC hinge threshold")
+    parser.add_argument("--w-auc-hinge", "--w-auc-thr", dest="w_auc_hinge", type=float, default=0.58, help="W→A AUC hinge threshold")
     parser.add_argument("--w-auc-feasible", type=float, default=0.56, help="W→A feasibility upper bound")
-    parser.add_argument("--z-r2-hinge", "--z-r2-thr", dest="z_r2_hinge", type=float, default=0.05, help="Z→Y leakage hinge R2")
-    parser.add_argument("--z-r2-feasible", type=float, default=0.08, help="Z→Y feasibility R2 upper bound")
-    parser.add_argument("--ess-ratio-target", type=float, default=0.40, help="Minimum ESS ratio target (hinge)")
-    parser.add_argument("--ess-ratio-feasible", type=float, default=0.35, help="ESS feasibility floor")
+    parser.add_argument("--z-r2-hinge", "--z-r2-thr", dest="z_r2_hinge", type=float, default=0.08, help="Z→Y leakage hinge R2")
+    parser.add_argument("--z-r2-feasible", type=float, default=0.05, help="Z→Y feasibility R2 upper bound")
+    parser.add_argument("--ess-ratio-target", type=float, default=0.35, help="Minimum ESS ratio target (hinge)")
+    parser.add_argument("--ess-ratio-feasible", type=float, default=0.40, help="ESS feasibility floor")
     parser.add_argument("--ate-scale", choices=["y_std", "y_mad", "tau_abs"], default="y_std", help="normalize ATE error")
     parser.add_argument("--plateau-window", type=int, default=25, help="Plateau detection window (trials)")
     parser.add_argument("--plateau-rel-impr", type=float, default=0.003, help="Relative improvement threshold for plateau stop")

@@ -1161,18 +1161,24 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             if cfg.adv_steps_dynamic:
                 diag_now = getattr(self, "training_diagnostics", {}) or {}
                 w_auc = float(diag_now.get("rep_auc_w_to_a", 0.5))
-                z_r2 = float(diag_now.get("rep_exclusion_leakage_r2", 0.0))
-                if w_auc > 0.58 or z_r2 > 0.16:
+                w_auc_eff = max(w_auc, 1.0 - w_auc)  # symmetric leakage measure
+                z_r2 = float(
+                    diag_now.get(
+                        "rep_exclusion_leakage_r2_cond",
+                        diag_now.get("rep_exclusion_leakage_r2", 0.0),
+                    )
+                )
+                if w_auc_eff > 0.58 or z_r2 > 0.16:
                     adv_steps_ep += 1
-                if w_auc > 0.64 or z_r2 > 0.22:
+                if w_auc_eff > 0.64 or z_r2 > 0.22:
                     adv_steps_ep += 1
                 adv_steps_ep = int(np.clip(adv_steps_ep, cfg.adv_steps_min, cfg.adv_steps_max))
 
                 # leak-driven strength boost: increase adversarial strength when leakage is high
                 leak_boost = 1.0
-                if w_auc > 0.64:
+                if w_auc_eff > 0.64:
                     leak_boost = 1.2
-                elif w_auc > 0.58:
+                elif w_auc_eff > 0.58:
                     leak_boost = 1.1
                 gamma_w_use *= leak_boost
                 gamma_w_cond *= leak_boost
