@@ -210,6 +210,11 @@ def enhanced_training_monitor(estimator: "IVAPCIv33TheoryHierEstimator", epoch: 
       - IV strength via iv_relevance_abs_corr
     Optionally increases gamma_adv_w early in training when W–A dependence is high.
     """
+    cfg = estimator.config
+    # When dynamic feedback is disabled, do not modify hyperparameters based on diagnostics.
+    if not getattr(cfg, "dynamic_feedback", True):
+        return
+
     if epoch % 10 != 0:
         return
 
@@ -1391,7 +1396,7 @@ class IVAPCIv33TheoryHierEstimator(BaseCausalEstimator):
             mean_val = float(np.mean(vals)) if vals else float("inf")
             self.main_sched.step(mean_val)
 
-            if epoch_batches > 0 and epoch % 10 == 0:
+            if cfg.dynamic_feedback and epoch_batches > 0 and epoch % 10 == 0:
                 try:
                     # quick validation-based diagnostics for monitoring
                     self._post_fit_quality_diagnostics(V_all=V_va, A=A_va, Y=Y_va)
